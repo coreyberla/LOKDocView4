@@ -84,6 +84,14 @@ public:
     void invalidate(const GdkRectangle& rRect);
     /// Marks all tiles stale.
     void invalidateAll();
+    /// A paint request for the tile was dropped: allow requesting it again.
+    void clearPending(int nColumn, int nRow);
+    /**
+       Bounds memory: if there are more than nMaxTiles tiles, drops the ones
+       farthest from (fCenterColumn, fCenterRow) (in tile units). Tiles with a
+       paint in flight are kept.
+    */
+    void evictFarthest(double fCenterColumn, double fCenterRow, size_t nMaxTiles);
     /// Whether any tile has content to show.
     bool hasTextures() const;
 

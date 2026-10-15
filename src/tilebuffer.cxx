@@ -9,6 +9,9 @@
 
 #include "tilebuffer.hxx"
 
+#include <algorithm>
+#include <vector>
+
 // 1 inch = 1440 twips = 96 px
 float pixelToTwip(float fInput, float zoom)
 {
@@ -74,6 +77,41 @@ void TileBuffer::invalidateAll()
 {
     for (auto& rEntry : m_aTiles)
         invalidateTile(rEntry.second);
+}
+
+void TileBuffer::clearPending(int nColumn, int nRow)
+{
+    auto it = m_aTiles.find({ nColumn, nRow });
+    if (it != m_aTiles.end())
+        it->second.m_bPending = false;
+}
+
+void TileBuffer::evictFarthest(double fCenterColumn, double fCenterRow, size_t nMaxTiles)
+{
+    if (m_aTiles.size() <= nMaxTiles)
+        return;
+
+    std::vector<std::pair<double, std::pair<int, int>>> aCandidates;
+    for (const auto& [rPosition, rTile] : m_aTiles)
+    {
+        if (rTile.m_bPending)
+            continue;
+        // Tile centers are at +0.5.
+        double fDX = rPosition.first + 0.5 - fCenterColumn;
+        double fDY = rPosition.second + 0.5 - fCenterRow;
+        aCandidates.emplace_back(fDX * fDX + fDY * fDY, rPosition);
+    }
+    std::sort(aCandidates.begin(), aCandidates.end(),
+              [](const auto& rA, const auto& rB) { return rA.first > rB.first; });
+
+    for (const auto& rCandidate : aCandidates)
+    {
+        if (m_aTiles.size() <= nMaxTiles)
+            break;
+        auto it = m_aTiles.find(rCandidate.second);
+        g_clear_object(&it->second.m_pTexture);
+        m_aTiles.erase(it);
+    }
 }
 
 bool TileBuffer::hasTextures() const

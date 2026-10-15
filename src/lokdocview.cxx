@@ -109,6 +109,15 @@ struct ViewHandle
     /// Read by the paint worker, so stale queued requests are skipped and
     /// stale results dropped.
     std::atomic<unsigned> m_nTileGeneration{ 0 };
+
+    /// Tiles worth painting, [start, end) in tile units: the visible ones plus
+    /// a prefetch margin, published by snapshot. Queued requests outside it
+    /// (e.g. scrolled away meanwhile) are skipped by the paint worker.
+    std::mutex m_aWantedMutex;
+    int m_nWantedColStart = 0;
+    int m_nWantedRowStart = 0;
+    int m_nWantedColEnd = INT_MAX;
+    int m_nWantedRowEnd = INT_MAX;
 };
 
 /// A LOK callback marshalled to the main loop.
@@ -1244,8 +1253,34 @@ struct PaintRequest
     int m_nRow;
     int m_nTilePixels;
     int m_nTileTwips;
+    /// Queue order: lower first (see comparePaintRequests()).
+    unsigned m_nPriority;
+    guint64 m_nSequence;
     GdkTexture* m_pTexture = nullptr; // result
 };
+
+/// Request order tiebreaker, main thread only.
+guint64 g_nPaintSequence = 0;
+}
+
+/// Paint queue order: by priority (distance from the viewport center,
+/// prefetch after visible tiles), then first come first served.
+static gint comparePaintRequests(gconstpointer pA, gconstpointer pB, gpointer)
+{
+    auto* pRequestA = static_cast<const PaintRequest*>(pA);
+    auto* pRequestB = static_cast<const PaintRequest*>(pB);
+    if (pRequestA->m_nPriority != pRequestB->m_nPriority)
+        return pRequestA->m_nPriority < pRequestB->m_nPriority ? -1 : 1;
+    return pRequestA->m_nSequence < pRequestB->m_nSequence ? -1 : pRequestA->m_nSequence > pRequestB->m_nSequence;
+}
+
+/// Worker thread: whether the tile is still in the area snapshot last asked for.
+static bool isTileWanted(const PaintRequest* pRequest)
+{
+    ViewHandle* pHandle = pRequest->m_pHandle;
+    std::scoped_lock<std::mutex> aGuard(pHandle->m_aWantedMutex);
+    return pRequest->m_nColumn >= pHandle->m_nWantedColStart && pRequest->m_nColumn < pHandle->m_nWantedColEnd
+           && pRequest->m_nRow >= pHandle->m_nWantedRowStart && pRequest->m_nRow < pHandle->m_nWantedRowEnd;
 }
 
 static void freePaintRequest(gpointer pData)
@@ -1261,15 +1296,20 @@ static gboolean paintTileDone(gpointer pData)
     auto* pRequest = static_cast<PaintRequest*>(pData);
 
     // Generation check first: also covers dispose, which bumps it.
-    if (pRequest->m_pTexture && pRequest->m_nGeneration == pRequest->m_pHandle->m_nTileGeneration)
+    if (pRequest->m_nGeneration == pRequest->m_pHandle->m_nTileGeneration)
     {
         if (gpointer pView = g_weak_ref_get(&pRequest->m_pHandle->m_aView))
         {
             LOKDocView* pDocView = LOK_DOC_VIEW(pView);
-            getPrivate(pDocView)->m_pTileBuffer->setTile(pRequest->m_nColumn, pRequest->m_nRow,
-                                                         std::exchange(pRequest->m_pTexture, nullptr),
-                                                         pRequest->m_nSerial);
-            gtk_widget_queue_draw(GTK_WIDGET(pDocView));
+            TileBuffer& rTiles = *getPrivate(pDocView)->m_pTileBuffer;
+            if (pRequest->m_pTexture)
+            {
+                rTiles.setTile(pRequest->m_nColumn, pRequest->m_nRow, std::exchange(pRequest->m_pTexture, nullptr),
+                               pRequest->m_nSerial);
+                gtk_widget_queue_draw(GTK_WIDGET(pDocView));
+            }
+            else // skipped as no longer wanted: request again if it comes back into view
+                rTiles.clearPending(pRequest->m_nColumn, pRequest->m_nRow);
             g_object_unref(pDocView);
         }
     }
@@ -1283,9 +1323,10 @@ static void paintTileInThread(gpointer pData, gpointer /*pUserData*/)
 {
     auto* pRequest = static_cast<PaintRequest*>(pData);
 
-    // Skip requests superseded while queued (zoom change, part switch, dispose).
-    // Dispose waits for a running paint before destroying the document.
-    if (pRequest->m_nGeneration == pRequest->m_pHandle->m_nTileGeneration)
+    // Skip requests superseded while queued (zoom change, part switch, dispose)
+    // or scrolled out of the wanted area. Dispose waits for a running paint
+    // before destroying the document.
+    if (pRequest->m_nGeneration == pRequest->m_pHandle->m_nTileGeneration && isTileWanted(pRequest))
     {
         int nTilePixels = pRequest->m_nTilePixels;
         int nTileTwips = pRequest->m_nTileTwips;
@@ -1314,7 +1355,7 @@ static void paintTileInThread(gpointer pData, gpointer /*pUserData*/)
     g_idle_add_full(G_PRIORITY_DEFAULT, paintTileDone, pRequest, nullptr);
 }
 
-static void requestTile(LOKDocView* pDocView, int nColumn, int nRow, Tile& rTile)
+static void requestTile(LOKDocView* pDocView, int nColumn, int nRow, Tile& rTile, unsigned nPriority)
 {
     LOKDocViewPrivate& priv = getPrivate(pDocView);
     rTile.m_bPending = true;
@@ -1328,7 +1369,9 @@ static void requestTile(LOKDocView* pDocView, int nColumn, int nRow, Tile& rTile
                                        nColumn,
                                        nRow,
                                        getTilePixels(priv),
-                                       getTileSizeTwips(priv) };
+                                       getTileSizeTwips(priv),
+                                       nPriority,
+                                       g_nPaintSequence++ };
     g_thread_pool_push(priv->m_pPaintPool, pRequest, nullptr);
 }
 
@@ -1380,6 +1423,58 @@ static void appendTiles(GtkSnapshot* pSnapshot, const TileBuffer& rTiles, float 
 }
 
 static void updateIMCursorLocation(LOKDocView* pDocView);
+
+/**
+ * Queues paints for missing or stale tiles, given the visible tile range
+ * [start, end) and the viewport center (tile units):
+ * - visible tiles nearest the center first (the queue is sorted by priority),
+ * - then a one-tile prefetch ring around them, so scrolling a little shows
+ *   painted tiles instead of blanks.
+ * Publishes that area to the worker, which skips queued requests that left
+ * it (e.g. after scrolling on) instead of painting them first. Also bounds
+ * the tile cache to a few times that area.
+ */
+static void requestTiles(LOKDocView* pDocView, int nColStart, int nRowStart, int nColEnd, int nRowEnd,
+                         double fCenterColumn, double fCenterRow)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    constexpr int nPrefetch = 1;
+    int nDocColumns = static_cast<int>(std::ceil(getDocumentWidthPixels(priv) / nTileSizePixels));
+    int nDocRows = static_cast<int>(std::ceil(getDocumentHeightPixels(priv) / nTileSizePixels));
+    int nWantedColStart = std::max(0, nColStart - nPrefetch);
+    int nWantedRowStart = std::max(0, nRowStart - nPrefetch);
+    int nWantedColEnd = std::min(nDocColumns, nColEnd + nPrefetch);
+    int nWantedRowEnd = std::min(nDocRows, nRowEnd + nPrefetch);
+    {
+        ViewHandle* pHandle = priv->m_pHandle;
+        std::scoped_lock<std::mutex> aGuard(pHandle->m_aWantedMutex);
+        pHandle->m_nWantedColStart = nWantedColStart;
+        pHandle->m_nWantedRowStart = nWantedRowStart;
+        pHandle->m_nWantedColEnd = nWantedColEnd;
+        pHandle->m_nWantedRowEnd = nWantedRowEnd;
+    }
+
+    for (int nRow = nWantedRowStart; nRow < nWantedRowEnd; ++nRow)
+    {
+        for (int nColumn = nWantedColStart; nColumn < nWantedColEnd; ++nColumn)
+        {
+            Tile& rTile = priv->m_pTileBuffer->getTile(nColumn, nRow);
+            if (rTile.m_bValid || rTile.m_bPending)
+                continue;
+
+            bool bVisible = nColumn >= nColStart && nColumn < nColEnd && nRow >= nRowStart && nRow < nRowEnd;
+            double fDX = nColumn + 0.5 - fCenterColumn;
+            double fDY = nRow + 0.5 - fCenterRow;
+            // Squared distance in 1/16 tiles; prefetch always after visible tiles.
+            unsigned nPriority = static_cast<unsigned>(std::min(fDX * fDX + fDY * fDY, 1e6) * 16)
+                                 + (bVisible ? 0 : 1u << 28);
+            requestTile(pDocView, nColumn, nRow, rTile, nPriority);
+        }
+    }
+
+    size_t nWanted = static_cast<size_t>(nWantedColEnd - nWantedColStart) * (nWantedRowEnd - nWantedRowStart);
+    priv->m_pTileBuffer->evictFarthest(fCenterColumn, fCenterRow, std::max<size_t>(64, 3 * nWanted));
+}
 
 static void appendRectangleOutline(GtkSnapshot* pSnapshot, const graphene_rect_t& rRect, float fWidth, const GdkRGBA& rColor)
 {
@@ -1485,17 +1580,12 @@ static void lok_doc_view_snapshot(GtkWidget* pWidget, GtkSnapshot* pSnapshot)
     int nColEnd = static_cast<int>(std::ceil(fVisRight / nTileSizePixels));
     int nRowEnd = static_cast<int>(std::ceil(fVisBottom / nTileSizePixels));
 
-    // TODO: request tiles nearest the viewport center first, and prefetch
-    // one row/column beyond the visible area.
     bool bComplete = true;
     for (int nRow = nRowStart; nRow < nRowEnd; ++nRow)
     {
         for (int nColumn = nColStart; nColumn < nColEnd; ++nColumn)
         {
             Tile& rTile = priv->m_pTileBuffer->getTile(nColumn, nRow);
-            if (!rTile.m_bValid && !rTile.m_bPending)
-                requestTile(pDocView, nColumn, nRow, rTile);
-
             graphene_rect_t aTileRect = GRAPHENE_RECT_INIT(float(nColumn * nTileSizePixels), float(nRow * nTileSizePixels),
                                                            float(nTileSizePixels), float(nTileSizePixels));
             if (rTile.m_pTexture)
@@ -1520,6 +1610,10 @@ static void lok_doc_view_snapshot(GtkWidget* pWidget, GtkSnapshot* pSnapshot)
     }
     if (bComplete)
         priv->m_pPreviousTiles.reset();
+
+    if (nColStart < nColEnd && nRowStart < nRowEnd)
+        requestTiles(pDocView, nColStart, nRowStart, nColEnd, nRowEnd,
+                     (fVisLeft + fVisRight) / 2 / nTileSizePixels, (fVisTop + fVisBottom) / 2 / nTileSizePixels);
 
     appendOverlays(pDocView, pSnapshot);
 
@@ -2186,6 +2280,7 @@ static void lok_doc_view_init (LOKDocView* pDocView)
     priv->m_pClipboardCancellable = g_cancellable_new();
     priv->m_pPaintPool = g_thread_pool_new_full(paintTileInThread, nullptr, freePaintRequest,
                                                 /*max_threads=*/1, /*exclusive=*/FALSE, nullptr);
+    g_thread_pool_set_sort_function(priv->m_pPaintPool, comparePaintRequests, nullptr);
 
     GtkWidget* pWidget = GTK_WIDGET(pDocView);
     gtk_widget_set_focusable(pWidget, TRUE);
