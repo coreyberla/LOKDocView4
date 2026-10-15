@@ -2944,6 +2944,8 @@ static gboolean spin_lok_loop(void *pData)
     return FALSE;
 }
 
+static std::string getDefaultLOPath();
+
 static gboolean lok_doc_view_initable_init (GInitable *initable, GCancellable* /*cancellable*/, GError **error)
 {
     LOKDocView *pDocView = LOK_DOC_VIEW (initable);
@@ -2951,6 +2953,11 @@ static gboolean lok_doc_view_initable_init (GInitable *initable, GCancellable* /
 
     if (priv->m_pOffice != nullptr)
         return true;
+
+    // Also when constructed with g_initable_new() and no "lopath", not just
+    // via lok_doc_view_new*().
+    if (priv->m_aLOPath.empty())
+        priv->m_aLOPath = getDefaultLOPath();
 
     if (priv->m_bUnipoll)
         (void)g_setenv("SAL_LOK_OPTIONS", "unipoll", FALSE);
