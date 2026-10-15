@@ -50,6 +50,7 @@ lokdocview_dep = declare_dependency(
 install_headers(
   'include/LibreOfficeKit/LibreOfficeKitGtk.h',
   'include/LibreOfficeKit/LibreOfficeKit.h',
+  'include/LibreOfficeKit/LibreOfficeKitEnums.h',
   'include/LibreOfficeKit/LibreOfficeKitTypes.h',
   subdir: 'lokdocview4/LibreOfficeKit',
 )

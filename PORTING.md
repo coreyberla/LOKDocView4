@@ -131,7 +131,11 @@ Done:
   position is applied in `size_allocate`, once the adjustments know the new size; zoom steps
   before that continue from the pending target. `setClientZoom` is coalesced into a low-priority
   idle (pinch would otherwise wait on the LOK mutex behind tile paints per step).
-- `demo/main.c` — plain-C viewer (zoom, edit toggle, progress, status).
+- `demo/main.c` — plain-C test viewer: zoom, edit toggle, Writer boundaries, bold/italic/underline
+  (`post_command` + state via `command-changed`), sheet/slide selector (`get_parts`/`get_part_name`/
+  `set_part`/`part-changed`), find bar (Ctrl+F; `find_next`/`find_prev`/`highlight_all`,
+  `search-not-found`, `search-result-count`), Calc cell address + formula (`address-changed`,
+  `formula-changed`). Covers the commonly used parts of gtktiledviewer.
 - Upstream's vcl/awt/boost deps replaced: local `MOUSE_*`/`KEY_*`/`AwtKey` constants, json-glib.
 
 Deliberate deviations from GTK3 widget:
@@ -169,7 +173,7 @@ Rendering notes (LibreOffice behaviour, not ours):
    handles (upstream PNGs), dragging graphic handles via `setGraphicSelection()`.
 2. `setClientVisibleArea`; IM `retrieve-surrounding` (needs text around the cursor from LOK).
 3. Impress invalidation mode (normal/notes/master) isn't checked yet, only the part.
-4. Comments, multi-view (`new_from_widget`), dialogs; port gtktiledviewer as test app.
+4. Comments, multi-view (`new_from_widget`, plus a "new view" button in the demo), dialogs.
 5. Clipboard leftover: lazy export (only convert the formats another app actually requests).
 
 ## TODO upstream (LibreOffice)
