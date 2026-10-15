@@ -19,12 +19,40 @@ typedef struct
     LOKDocView* pDocView;
     GtkWidget* pProgress;
     GtkWidget* pStatus;
+    GtkWidget* pBoundaries;
 } DemoWindow;
 
-static void freeDemoWindow(gpointer pData, GObject* pWindow)
+/**
+ * file:// URL of a LibreOffice user profile private to this demo, so it
+ * neither shares settings with nor fights over the profile lock of a desktop
+ * LibreOffice. Created on first use by LibreOffice itself.
+ */
+static char* getUserProfileURL(void)
 {
-    (void)pWindow;
-    g_free(pData);
+    g_autofree char* pDir = g_build_filename(g_get_user_config_dir(), "lokdocview4", NULL);
+    g_mkdir_with_parents(pDir, 0700);
+    return g_filename_to_uri(pDir, NULL, NULL);
+}
+
+/// Writer formatting aids (table/text/section boundaries); LibreOffice >= 25.2.
+static void applyBoundaries(DemoWindow* pWindow)
+{
+    gboolean bShow = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(pWindow->pBoundaries));
+    g_autofree char* pArguments = g_strdup_printf(
+        "{\"ShowBoundaries\":{\"type\":\"boolean\",\"value\":\"%s\"}}", bShow ? "true" : "false");
+    lok_doc_view_post_command(pWindow->pDocView, ".uno:ShowBoundaries", pArguments, FALSE);
+}
+
+static void onBoundariesToggled(GtkToggleButton* pButton, DemoWindow* pWindow)
+{
+    (void)pButton;
+    applyBoundaries(pWindow);
+}
+
+/// The DemoWindow owned by a toplevel (freed together with it).
+static DemoWindow* getDemoWindow(gpointer pAppWindow)
+{
+    return g_object_get_data(G_OBJECT(pAppWindow), "demo-window");
 }
 
 static void onZoom(GtkButton* pButton, DemoWindow* pWindow)
@@ -38,16 +66,20 @@ static void onEditToggled(GtkToggleButton* pButton, DemoWindow* pWindow)
     lok_doc_view_set_edit(pWindow->pDocView, gtk_toggle_button_get_active(pButton));
 }
 
-static void onLoadChanged(LOKDocView* pDocView, gdouble fProgress, DemoWindow* pWindow)
+// LOKDocView signal handlers get the toplevel, connected with
+// g_signal_connect_object() so they're disconnected when it goes away: the
+// view can outlive its window (a load in progress keeps it alive).
+
+static void onLoadChanged(LOKDocView* pDocView, gdouble fProgress, GtkWindow* pAppWindow)
 {
     (void)pDocView;
-    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(pWindow->pProgress), fProgress);
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(getDemoWindow(pAppWindow)->pProgress), fProgress);
 }
 
-static void onCommandChanged(LOKDocView* pDocView, const gchar* pPayload, DemoWindow* pWindow)
+static void onCommandChanged(LOKDocView* pDocView, const gchar* pPayload, GtkWindow* pAppWindow)
 {
     (void)pDocView;
-    gtk_label_set_text(GTK_LABEL(pWindow->pStatus), pPayload);
+    gtk_label_set_text(GTK_LABEL(getDemoWindow(pAppWindow)->pStatus), pPayload);
 }
 
 static void onHyperlinkClicked(LOKDocView* pDocView, const gchar* pURI, gpointer pData)
@@ -58,11 +90,25 @@ static void onHyperlinkClicked(LOKDocView* pDocView, const gchar* pURI, gpointer
     g_object_unref(pLauncher);
 }
 
+/// pData: a heap GWeakRef to the toplevel, which may be gone by now.
 static void onDocumentOpened(GObject* pSource, GAsyncResult* pResult, gpointer pData)
 {
-    DemoWindow* pWindow = pData;
+    GWeakRef* pWindowRef = pData;
+    g_autoptr(GtkWindow) pAppWindow = g_weak_ref_get(pWindowRef);
+    g_weak_ref_clear(pWindowRef);
+    g_free(pWindowRef);
+
     GError* pError = NULL;
-    if (!lok_doc_view_open_document_finish(LOK_DOC_VIEW(pSource), pResult, &pError))
+    gboolean bLoaded = lok_doc_view_open_document_finish(LOK_DOC_VIEW(pSource), pResult, &pError);
+    if (!pAppWindow)
+    {
+        // Window closed while loading; nothing left to update.
+        g_clear_error(&pError);
+        return;
+    }
+
+    DemoWindow* pWindow = getDemoWindow(pAppWindow);
+    if (!bLoaded)
     {
         gtk_label_set_text(GTK_LABEL(pWindow->pStatus), pError->message);
         g_warning("Error opening document: %s", pError->message);
@@ -71,12 +117,15 @@ static void onDocumentOpened(GObject* pSource, GAsyncResult* pResult, gpointer p
     }
     gtk_widget_set_visible(pWindow->pProgress, FALSE);
     gtk_label_set_text(GTK_LABEL(pWindow->pStatus), "Loaded");
+    // The profile remembers the last state; make the view match the toggle.
+    applyBoundaries(pWindow);
 }
 
 static void openWindow(GtkApplication* pApp, GFile* pFile)
 {
     GError* pError = NULL;
-    GtkWidget* pDocView = lok_doc_view_new(g_pLOPath, NULL, &pError);
+    g_autofree char* pProfileURL = getUserProfileURL();
+    GtkWidget* pDocView = lok_doc_view_new_from_user_profile(g_pLOPath, pProfileURL, NULL, &pError);
     if (!pDocView)
     {
         g_printerr("%s\n", pError->message);
@@ -88,7 +137,7 @@ static void openWindow(GtkApplication* pApp, GFile* pFile)
     pWindow->pDocView = LOK_DOC_VIEW(pDocView);
 
     GtkWidget* pAppWindow = gtk_application_window_new(pApp);
-    g_object_weak_ref(G_OBJECT(pAppWindow), freeDemoWindow, pWindow);
+    g_object_set_data_full(G_OBJECT(pAppWindow), "demo-window", pWindow, g_free);
     g_autofree char* pBasename = g_file_get_basename(pFile);
     gtk_window_set_title(GTK_WINDOW(pAppWindow), pBasename);
     gtk_window_set_default_size(GTK_WINDOW(pAppWindow), 1000, 800);
@@ -104,6 +153,11 @@ static void openWindow(GtkApplication* pApp, GFile* pFile)
     gtk_header_bar_pack_start(GTK_HEADER_BAR(pHeader), pZoomOut);
     gtk_header_bar_pack_start(GTK_HEADER_BAR(pHeader), pZoomIn);
     gtk_header_bar_pack_end(GTK_HEADER_BAR(pHeader), pEdit);
+    // Off by default, like a typical desktop setup; applied once the document is loaded.
+    pWindow->pBoundaries = gtk_toggle_button_new_with_label("Boundaries");
+    gtk_widget_set_tooltip_text(pWindow->pBoundaries, "Show table, text and section boundaries (Writer)");
+    g_signal_connect(pWindow->pBoundaries, "toggled", G_CALLBACK(onBoundariesToggled), pWindow);
+    gtk_header_bar_pack_end(GTK_HEADER_BAR(pHeader), pWindow->pBoundaries);
     gtk_window_set_titlebar(GTK_WINDOW(pAppWindow), pHeader);
 
     GtkWidget* pBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
@@ -124,12 +178,14 @@ static void openWindow(GtkApplication* pApp, GFile* pFile)
 
     gtk_window_set_child(GTK_WINDOW(pAppWindow), pBox);
 
-    g_signal_connect(pDocView, "load-changed", G_CALLBACK(onLoadChanged), pWindow);
-    g_signal_connect(pDocView, "command-changed", G_CALLBACK(onCommandChanged), pWindow);
+    g_signal_connect_object(pDocView, "load-changed", G_CALLBACK(onLoadChanged), pAppWindow, 0);
+    g_signal_connect_object(pDocView, "command-changed", G_CALLBACK(onCommandChanged), pAppWindow, 0);
     g_signal_connect(pDocView, "hyperlink-clicked", G_CALLBACK(onHyperlinkClicked), NULL);
 
+    GWeakRef* pWindowRef = g_new(GWeakRef, 1);
+    g_weak_ref_init(pWindowRef, pAppWindow);
     g_autofree char* pPath = g_file_get_path(pFile);
-    lok_doc_view_open_document(LOK_DOC_VIEW(pDocView), pPath, "{}", NULL, onDocumentOpened, pWindow);
+    lok_doc_view_open_document(LOK_DOC_VIEW(pDocView), pPath, "{}", NULL, onDocumentOpened, pWindowRef);
 
     gtk_window_present(GTK_WINDOW(pAppWindow));
     gtk_widget_grab_focus(pDocView);
@@ -165,6 +221,7 @@ int main(int argc, char** argv)
     g_signal_connect(pApp, "activate", G_CALLBACK(onActivate), NULL);
 
     int nRet = g_application_run(G_APPLICATION(pApp), argc, argv);
+    g_debug("main loop finished, exiting");
     g_object_unref(pApp);
     g_free(g_pLOPath);
     return nRet;

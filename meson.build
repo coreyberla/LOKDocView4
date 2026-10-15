@@ -65,5 +65,6 @@ if get_option('demo')
   executable('lokdocview4-demo',
     'demo/main.c',
     dependencies: lokdocview_dep,
+    c_args: ['-DG_LOG_DOMAIN="LOKDocViewDemo"'],
   )
 endif

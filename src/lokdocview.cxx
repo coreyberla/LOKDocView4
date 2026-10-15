@@ -2098,6 +2098,25 @@ LOKPostCommand (LOKDocView* pDocView,
     priv->m_pDocument->pClass->postUnoCommand(priv->m_pDocument, pCommand, pArguments, bNotifyWhenFinished);
 }
 
+/**
+ * Commands that only change how the view displays the document, never the
+ * document itself, so lok_doc_view_post_command() lets them through in
+ * view-only mode. (The GTK3 widget dropped every command in view-only mode.)
+ */
+static bool isViewOnlyCommand(const gchar* pCommand)
+{
+    static const char* const aCommands[] = {
+        ".uno:ShowBoundaries",     // Writer formatting aids, LibreOffice >= 25.2
+        ".uno:TableBoundaries",    // deprecated 25.2
+        ".uno:ViewBounds",         // text boundaries, deprecated 25.2
+        ".uno:SectionBoundaries",  // deprecated 25.2
+    };
+    for (const char* pViewCommand : aCommands)
+        if (g_strcmp0(pCommand, pViewCommand) == 0)
+            return true;
+    return false;
+}
+
 static void addTypedValue(JsonBuilder* pBuilder, const char* pName, const char* pType, auto&& fnValue)
 {
     json_builder_set_member_name(pBuilder, pName);
@@ -2548,7 +2567,7 @@ lok_doc_view_post_command (LOKDocView* pDocView,
     if (!priv->m_pDocument)
         return;
 
-    if (priv->m_bEdit)
+    if (priv->m_bEdit || isViewOnlyCommand(pCommand))
         LOKPostCommand(pDocView, pCommand, pArguments, bNotifyWhenFinished);
     else
         g_info ("LOK_POST_COMMAND: ignoring commands in view-only mode");
