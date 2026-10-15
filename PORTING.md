@@ -90,6 +90,11 @@ Done:
   `delete-surrounding` → `removeTextContext`. Candidate window follows the cursor
   (`set_cursor_location` from snapshot). KEYUP only for keys whose press was posted, matched by
   hardware keycode.
+- Fractional scaling: tiles are rendered at `round(256 × gdk_surface_get_scale())` device pixels
+  (followed via the surface's `notify::scale` from realize to unrealize; `notify::scale-factor`
+  still covers X11), and the document origin is snapped to device pixels in surface coordinates,
+  since the widget itself can sit at a fractional device position. Exact for the usual scales
+  (1.25, 1.5, 1.75, 2); others (e.g. 4/3) scale tiles very slightly.
 - System clipboard (`GdkClipboard`); the GTK3 widget only had LOK's internal per-view clipboard.
   - Copy/cut: shortcuts and `post_command` run `.uno:Copy`/`.uno:Cut` with bNotifyWhenFinished;
     on its `LOK_CALLBACK_UNO_COMMAND_RESULT` the LOK clipboard is fetched eagerly via
@@ -148,7 +153,7 @@ Rendering notes (LibreOffice behaviour, not ours):
 1. Overlays still missing: other views' cursors/selections, content controls, touch selection
    handles (upstream PNGs), dragging graphic handles via `setGraphicSelection()`.
 2. `setClientVisibleArea`; IM `retrieve-surrounding` (needs text around the cursor from LOK).
-3. Fractional scaling, part-aware invalidation; center-out tile order + prefetch.
+3. Part-aware invalidation; center-out tile order + prefetch.
 4. Comments, multi-view (`new_from_widget`), dialogs; port gtktiledviewer as test app.
 5. Clipboard leftovers: primary selection (middle-click paste), lazy export (only convert the
    formats another app actually requests).

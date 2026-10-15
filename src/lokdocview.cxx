@@ -136,7 +136,12 @@ struct LOKDocViewPrivateImpl
     long m_nDocumentWidthTwips = 0;
     long m_nDocumentHeightTwips = 0;
     float m_fZoom = 1.0f;
-    gint m_nScaleFactor = 1;
+    /// Device pixels per logical pixel: the surface's scale, which may be
+    /// fractional (e.g. 1.25), unlike gtk_widget_get_scale_factor().
+    double m_fScale = 1.0;
+    /// Surface whose notify::scale we follow while realized.
+    GdkSurface* m_pScaleSurface = nullptr;
+    gulong m_nScaleHandlerId = 0;
 
     /// Tiles for the current zoom level and scale factor.
     std::unique_ptr<TileBuffer> m_pTileBuffer = std::make_unique<TileBuffer>();
@@ -363,6 +368,33 @@ static int getTileSizeTwips(LOKDocViewPrivate& priv)
 }
 
 /**
+ * Size of a tile in device pixels. A whole number of device pixels per
+ * 256-pixel tile for the usual scales (1.25, 1.5, 1.75, 2, ...); for others
+ * (e.g. 4/3) tiles get scaled very slightly when drawn.
+ */
+static int getTilePixels(LOKDocViewPrivate& priv)
+{
+    return static_cast<int>(std::max(1L, std::lround(nTileSizePixels * priv->m_fScale)));
+}
+
+/// Position of the widget's origin in its surface's coordinates.
+static void getSurfaceOffset(GtkWidget* pWidget, double& rX, double& rY)
+{
+    rX = rY = 0;
+    GtkNative* pNative = gtk_widget_get_native(pWidget);
+    if (!pNative)
+        return;
+    graphene_point_t aOrigin = GRAPHENE_POINT_INIT(0, 0);
+    graphene_point_t aPoint;
+    if (!gtk_widget_compute_point(pWidget, GTK_WIDGET(pNative), &aOrigin, &aPoint))
+        return;
+    double fTransformX, fTransformY;
+    gtk_native_get_surface_transform(pNative, &fTransformX, &fTransformY);
+    rX = aPoint.x + fTransformX;
+    rY = aPoint.y + fTransformY;
+}
+
+/**
  * Widget coordinates of the document's top-left corner: centered when the
  * document is narrower/shorter than the viewport, otherwise scrolled.
  * Snapped to device pixels so tiles stay crisp.
@@ -379,9 +411,13 @@ static void getDocumentOrigin(LOKDocView* pDocView, double& rX, double& rY)
     rX = fDocWidth < nWidth ? (nWidth - fDocWidth) / 2 : -gtk_adjustment_get_value(priv->m_pHAdjustment);
     rY = fDocHeight < nHeight ? (nHeight - fDocHeight) / 2 : -gtk_adjustment_get_value(priv->m_pVAdjustment);
 
-    double fScale = priv->m_nScaleFactor;
-    rX = std::round(rX * fScale) / fScale;
-    rY = std::round(rY * fScale) / fScale;
+    // Snap in surface coordinates: at fractional scales the widget itself
+    // may sit at a fractional device pixel position.
+    double fScale = priv->m_fScale;
+    double fOffsetX, fOffsetY;
+    getSurfaceOffset(pWidget, fOffsetX, fOffsetY);
+    rX = std::round((rX + fOffsetX) * fScale) / fScale - fOffsetX;
+    rY = std::round((rY + fOffsetY) * fScale) / fScale - fOffsetY;
 }
 
 /// Converts widget coordinates to document twips.
@@ -445,7 +481,7 @@ static void updateClientZoom(LOKDocView* pDocView)
     if (!priv->m_pDocument)
         return;
 
-    int nTilePixels = nTileSizePixels * priv->m_nScaleFactor;
+    int nTilePixels = getTilePixels(priv);
     int nTileTwips = getTileSizeTwips(priv);
     std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
     setDocumentView(priv->m_pDocument, priv->m_nViewId);
@@ -1291,7 +1327,7 @@ static void requestTile(LOKDocView* pDocView, int nColumn, int nRow, Tile& rTile
                                        rTile.m_nSerial,
                                        nColumn,
                                        nRow,
-                                       nTileSizePixels * priv->m_nScaleFactor,
+                                       getTilePixels(priv),
                                        getTileSizeTwips(priv) };
     g_thread_pool_push(priv->m_pPaintPool, pRequest, nullptr);
 }
@@ -1521,15 +1557,55 @@ static void lok_doc_view_size_allocate(GtkWidget* pWidget, int /*nWidth*/, int /
     }
 }
 
-static void onScaleFactorChanged(GObject* pObject, GParamSpec*, gpointer)
+/// Re-reads the (possibly fractional) scale and re-renders at the new resolution.
+static void updateScale(LOKDocView* pDocView)
 {
-    LOKDocView* pDocView = LOK_DOC_VIEW(pObject);
     LOKDocViewPrivate& priv = getPrivate(pDocView);
-    // TODO: fractional scaling (gdk_surface_get_scale()).
-    priv->m_nScaleFactor = gtk_widget_get_scale_factor(GTK_WIDGET(pDocView));
+    double fScale = priv->m_pScaleSurface ? gdk_surface_get_scale(priv->m_pScaleSurface)
+                                          : gtk_widget_get_scale_factor(GTK_WIDGET(pDocView));
+    if (fScale <= 0 || fScale == priv->m_fScale)
+        return;
+
+    g_debug("scale %.3f -> %.3f (tiles %d px)", priv->m_fScale, fScale,
+            static_cast<int>(std::lround(nTileSizePixels * fScale)));
+    priv->m_fScale = fScale;
     // Same layout, new resolution: old tiles are a fine placeholder.
     startNewTileGeneration(pDocView, true);
     updateClientZoom(pDocView);
+}
+
+static void onScaleChanged(GObject*, GParamSpec*, gpointer pData)
+{
+    updateScale(LOK_DOC_VIEW(pData));
+}
+
+/// Follow the surface's scale: notify::scale-factor only reports integer changes.
+static void lok_doc_view_realize(GtkWidget* pWidget)
+{
+    GTK_WIDGET_CLASS(lok_doc_view_parent_class)->realize(pWidget);
+
+    LOKDocView* pDocView = LOK_DOC_VIEW(pWidget);
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    if (GtkNative* pNative = gtk_widget_get_native(pWidget))
+    {
+        if (GdkSurface* pSurface = gtk_native_get_surface(pNative))
+        {
+            priv->m_pScaleSurface = GDK_SURFACE(g_object_ref(pSurface));
+            priv->m_nScaleHandlerId = g_signal_connect(pSurface, "notify::scale", G_CALLBACK(onScaleChanged), pDocView);
+        }
+    }
+    updateScale(pDocView);
+}
+
+static void lok_doc_view_unrealize(GtkWidget* pWidget)
+{
+    LOKDocViewPrivate& priv = getPrivate(LOK_DOC_VIEW(pWidget));
+    if (priv->m_pScaleSurface)
+    {
+        g_clear_signal_handler(&priv->m_nScaleHandlerId, priv->m_pScaleSurface);
+        g_clear_object(&priv->m_pScaleSurface);
+    }
+    GTK_WIDGET_CLASS(lok_doc_view_parent_class)->unrealize(pWidget);
 }
 
 // ---------------------------------------------------------------------------
@@ -2114,7 +2190,7 @@ static void lok_doc_view_init (LOKDocView* pDocView)
     GtkWidget* pWidget = GTK_WIDGET(pDocView);
     gtk_widget_set_focusable(pWidget, TRUE);
     gtk_widget_set_overflow(pWidget, GTK_OVERFLOW_HIDDEN);
-    priv->m_nScaleFactor = gtk_widget_get_scale_factor(pWidget);
+    priv->m_fScale = gtk_widget_get_scale_factor(pWidget); // until realized, see lok_doc_view_realize()
 
     setAdjustment(pDocView, priv->m_pHAdjustment, nullptr);
     setAdjustment(pDocView, priv->m_pVAdjustment, nullptr);
@@ -2159,7 +2235,8 @@ static void lok_doc_view_init (LOKDocView* pDocView)
     g_signal_connect_swapped(pFocus, "leave", G_CALLBACK(onFocusChanged), pDocView);
     gtk_widget_add_controller(pWidget, pFocus);
 
-    g_signal_connect(pDocView, "notify::scale-factor", G_CALLBACK(onScaleFactorChanged), nullptr);
+    // Covers backends without a fractional surface scale (X11).
+    g_signal_connect(pDocView, "notify::scale-factor", G_CALLBACK(onScaleChanged), pDocView);
 }
 
 static void lok_doc_view_set_property (GObject* object, guint propId, const GValue *value, GParamSpec *pspec)
@@ -2495,6 +2572,8 @@ static void lok_doc_view_class_init (LOKDocViewClass* pClass)
     pWidgetClass->snapshot = lok_doc_view_snapshot;
     pWidgetClass->measure = lok_doc_view_measure;
     pWidgetClass->size_allocate = lok_doc_view_size_allocate;
+    pWidgetClass->realize = lok_doc_view_realize;
+    pWidgetClass->unrealize = lok_doc_view_unrealize;
 
     gtk_widget_class_set_css_name(pWidgetClass, "lokdocview");
 
