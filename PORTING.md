@@ -76,7 +76,9 @@ Done:
   - Zoom/scale changes bump an atomic generation: queued requests for the old one are
     skipped, old tiles are drawn scaled as a placeholder until the view is complete.
 - `src/tilebuffer.*` — texture cache with valid/pending/serial state per tile.
-- `demo/main.c` — plain-C viewer (zoom, edit toggle, progress, status).
+- Overlays (`appendOverlays()`): own text cursor (blinks per `gtk-cursor-blink*` settings, only
+  while focused and in edit mode), text selection, graphic selection frame + 8 handles, Calc cell
+  cursor. `cursor-changed` reports twips like the GTK3 widget (its docs say pixels).- `demo/main.c` — plain-C viewer (zoom, edit toggle, progress, status).
 - Upstream's vcl/awt/boost deps replaced: local `MOUSE_*`/`KEY_*`/`AwtKey` constants, json-glib.
 
 Deliberate deviations from GTK3 widget:
@@ -110,7 +112,8 @@ Rendering notes (LibreOffice behaviour, not ours):
   thread under `g_aLOKMutex`, so they can wait for at most one in-flight tile paint.
 
 ## Next steps
-1. Overlays: visible cursor (+blink), text selection, handles, graphic selection, cell cursor, other views.
+1. Overlays still missing: other views' cursors/selections, content controls, touch selection
+   handles (upstream PNGs), dragging graphic handles via `setGraphicSelection()`.
 2. IM context (`GtkIMMulticontext`), mouse pointer shape (`LOK_CALLBACK_MOUSE_POINTER`), `setClientVisibleArea`.
 3. Zoom anchoring, fractional scaling, part-aware invalidation; center-out tile order + prefetch.
 4. Clipboard (`GdkClipboard`), comments, multi-view (`new_from_widget`), dialogs; port gtktiledviewer as test app.

@@ -40,6 +40,7 @@
 #include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "tilebuffer.hxx"
 
@@ -171,6 +172,24 @@ struct LOKDocViewPrivateImpl
     int m_nClickCount = 0;
     guint32 m_nLastPressTime = 0;
     guint m_nLastPressButton = 0;
+
+    // Overlay state, in document twips (LOK draws none of this into tiles).
+    /// Own text cursor (LOK_CALLBACK_INVALIDATE_VISIBLE_CURSOR); width may be 0.
+    GdkRectangle m_aVisibleCursor = {};
+    /// LOK_CALLBACK_CURSOR_VISIBLE. Starts true: LOK doesn't necessarily send
+    /// it on load, only when the cursor gets hidden/shown later.
+    bool m_bCursorVisible = true;
+    /// Blink phase; the cursor is drawn only while this is set.
+    bool m_bCursorBlinkOn = true;
+    guint m_nBlinkTimeoutId = 0;
+    /// Owned by the widget.
+    GtkEventControllerFocus* m_pFocusController = nullptr;
+    gint64 m_nBlinkStartTime = 0;
+    std::vector<GdkRectangle> m_aTextSelectionRectangles;
+    /// Selected shape/image, empty if none.
+    GdkRectangle m_aGraphicSelection = {};
+    /// Calc cell cursor, empty if none.
+    GdkRectangle m_aCellCursor = {};
 
     ViewHandle* m_pHandle = nullptr;
     /// Application held while a document loads, see lok_doc_view_open_document().
@@ -431,15 +450,10 @@ static void setIsLoading(LOKDocView* pDocView, bool bIsLoading)
 // LOK callbacks
 // ---------------------------------------------------------------------------
 
-/// Parses "x, y, width, height[, part[, mode]]" (twips) or "EMPTY[, part[, mode]]".
-static bool parseInvalidation(const std::string& rPayload, GdkRectangle& rRect, bool& rbAll)
+/// Parses the leading "x, y, width, height" of a payload; LOK appends extra fields to some.
+static bool parseRectangle(const char* p, GdkRectangle& rRect)
 {
-    rbAll = rPayload.compare(0, 5, "EMPTY") == 0;
-    if (rbAll)
-        return true;
-
     long aValues[4];
-    const char* p = rPayload.c_str();
     for (long& rValue : aValues)
     {
         char* pEnd = nullptr;
@@ -455,6 +469,141 @@ static bool parseInvalidation(const std::string& rPayload, GdkRectangle& rRect, 
               static_cast<int>(std::min<long>(aValues[2], INT_MAX)),
               static_cast<int>(std::min<long>(aValues[3], INT_MAX)) };
     return true;
+}
+
+/// Parses "x, y, width, height[, part[, mode]]" (twips) or "EMPTY[, part[, mode]]".
+static bool parseInvalidation(const std::string& rPayload, GdkRectangle& rRect, bool& rbAll)
+{
+    rbAll = rPayload.compare(0, 5, "EMPTY") == 0;
+    return rbAll || parseRectangle(rPayload.c_str(), rRect);
+}
+
+static bool isEmptyRectangle(const GdkRectangle& rRect)
+{
+    // A text cursor legitimately has width 0, so only "no height" counts as empty.
+    return rRect.height <= 0;
+}
+
+/// Parses an overlay rectangle (twips), clamped to the document; empty for
+/// "EMPTY" or anything unparsable.
+static GdkRectangle payloadToRectangle(LOKDocViewPrivate& priv, const char* pPayload)
+{
+    GdkRectangle aRect = {};
+    if (g_str_has_prefix(pPayload, "EMPTY") || !parseRectangle(pPayload, aRect))
+        return {};
+
+    aRect.x = std::max(aRect.x, 0);
+    aRect.y = std::max(aRect.y, 0);
+    aRect.width = static_cast<int>(std::min<long>(aRect.width, priv->m_nDocumentWidthTwips - aRect.x));
+    aRect.height = static_cast<int>(std::min<long>(aRect.height, priv->m_nDocumentHeightTwips - aRect.y));
+    return aRect;
+}
+
+/// Parses "rect; rect; ..." or "EMPTY".
+static std::vector<GdkRectangle> payloadToRectangles(LOKDocViewPrivate& priv, const char* pPayload)
+{
+    std::vector<GdkRectangle> aRectangles;
+    if (g_str_has_prefix(pPayload, "EMPTY"))
+        return aRectangles;
+
+    g_auto(GStrv) ppRectangles = g_strsplit(pPayload, "; ", 0);
+    for (gchar** ppRectangle = ppRectangles; *ppRectangle; ++ppRectangle)
+    {
+        GdkRectangle aRect = payloadToRectangle(priv, *ppRectangle);
+        if (!isEmptyRectangle(aRect))
+            aRectangles.push_back(aRect);
+    }
+    return aRectangles;
+}
+
+/// Whether the own text cursor should be drawn at all (ignoring the blink phase).
+static bool isCursorShown(LOKDocView* pDocView)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    // Ask the focus controller rather than gtk_widget_has_focus(): it is
+    // already up to date when its enter/leave signals run.
+    return priv->m_bEdit && priv->m_bCursorVisible && !isEmptyRectangle(priv->m_aVisibleCursor)
+           && priv->m_pFocusController && gtk_event_controller_focus_is_focus(priv->m_pFocusController);
+}
+
+static gboolean onCursorBlink(gpointer pData)
+{
+    LOKDocView* pDocView = LOK_DOC_VIEW(pData);
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+
+    // Like GTK's text widgets: stop blinking (cursor shown) after
+    // gtk-cursor-blink-timeout seconds without cursor movement.
+    int nBlinkTimeoutSeconds = 10;
+    g_object_get(gtk_widget_get_settings(GTK_WIDGET(pDocView)), "gtk-cursor-blink-timeout", &nBlinkTimeoutSeconds, nullptr);
+    if (g_get_monotonic_time() - priv->m_nBlinkStartTime > gint64(nBlinkTimeoutSeconds) * G_USEC_PER_SEC)
+    {
+        priv->m_bCursorBlinkOn = true;
+        priv->m_nBlinkTimeoutId = 0;
+        gtk_widget_queue_draw(GTK_WIDGET(pDocView));
+        return G_SOURCE_REMOVE;
+    }
+
+    priv->m_bCursorBlinkOn = !priv->m_bCursorBlinkOn;
+    gtk_widget_queue_draw(GTK_WIDGET(pDocView));
+    return G_SOURCE_CONTINUE;
+}
+
+/**
+ * Shows the cursor solid and (re)starts blinking: call when the cursor moves,
+ * focus or edit mode changes. Honours gtk-cursor-blink / -blink-time.
+ */
+static void restartCursorBlink(LOKDocView* pDocView)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    priv->m_bCursorBlinkOn = true;
+    g_clear_handle_id(&priv->m_nBlinkTimeoutId, g_source_remove);
+    gtk_widget_queue_draw(GTK_WIDGET(pDocView));
+
+    if (!isCursorShown(pDocView))
+        return;
+
+    gboolean bBlink = TRUE;
+    int nBlinkTime = 1200;
+    g_object_get(gtk_widget_get_settings(GTK_WIDGET(pDocView)),
+                 "gtk-cursor-blink", &bBlink, "gtk-cursor-blink-time", &nBlinkTime, nullptr);
+    if (!bBlink || nBlinkTime <= 0)
+        return;
+
+    priv->m_nBlinkStartTime = g_get_monotonic_time();
+    // gtk-cursor-blink-time is a full on/off cycle.
+    priv->m_nBlinkTimeoutId = g_timeout_add(nBlinkTime / 2, onCursorBlink, pDocView);
+}
+
+/// LOK_CALLBACK_INVALIDATE_VISIBLE_CURSOR: JSON {"viewId", "rectangle", ...},
+/// or a bare rectangle from older LibreOffice versions.
+static void setVisibleCursor(LOKDocView* pDocView, const std::string& rPayload)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    std::string aRectangle = rPayload;
+
+    if (!rPayload.empty() && rPayload[0] == '{')
+    {
+        g_autoptr(JsonParser) pParser = json_parser_new();
+        if (!json_parser_load_from_data(pParser, rPayload.c_str(), -1, nullptr))
+            return;
+        JsonNode* pRoot = json_parser_get_root(pParser);
+        if (!JSON_NODE_HOLDS_OBJECT(pRoot))
+            return;
+        JsonObject* pObject = json_node_get_object(pRoot);
+        // viewId is a string in the payload; other views' cursors come via
+        // LOK_CALLBACK_INVALIDATE_VIEW_CURSOR, so this should always be ours.
+        if (const char* pViewId = json_object_get_string_member_with_default(pObject, "viewId", nullptr))
+            if (std::atoi(pViewId) != priv->m_nViewId)
+                return;
+        aRectangle = json_object_get_string_member_with_default(pObject, "rectangle", "");
+    }
+
+    priv->m_aVisibleCursor = payloadToRectangle(priv, aRectangle.c_str());
+    // Twips, like the GTK3 widget (its docs say pixels).
+    g_signal_emit(pDocView, doc_view_signals[CURSOR_CHANGED], 0,
+                  priv->m_aVisibleCursor.x, priv->m_aVisibleCursor.y,
+                  priv->m_aVisibleCursor.width, priv->m_aVisibleCursor.height);
+    restartCursorBlink(pDocView);
 }
 
 static void invalidateTiles(LOKDocView* pDocView, const std::string& rPayload)
@@ -553,9 +702,33 @@ static void handleCallback(LOKDocView* pDocView, CallbackEvent* pEvent)
     case LOK_CALLBACK_CELL_FORMULA:
         g_signal_emit(pDocView, doc_view_signals[FORMULA_CHANGED], 0, pPayload);
         break;
+    case LOK_CALLBACK_INVALIDATE_VISIBLE_CURSOR:
+        setVisibleCursor(pDocView, rPayload);
+        break;
+    case LOK_CALLBACK_CURSOR_VISIBLE:
+        priv->m_bCursorVisible = rPayload == "true";
+        restartCursorBlink(pDocView);
+        break;
     case LOK_CALLBACK_TEXT_SELECTION:
-        // TODO: store the selection rectangles and draw them as an overlay.
-        g_signal_emit(pDocView, doc_view_signals[TEXT_SELECTION], 0, gboolean(!rPayload.empty() && rPayload != "EMPTY"));
+        priv->m_aTextSelectionRectangles = payloadToRectangles(priv, pPayload);
+        g_signal_emit(pDocView, doc_view_signals[TEXT_SELECTION], 0, gboolean(!priv->m_aTextSelectionRectangles.empty()));
+        gtk_widget_queue_draw(GTK_WIDGET(pDocView));
+        break;
+    case LOK_CALLBACK_TEXT_SELECTION_START:
+    case LOK_CALLBACK_TEXT_SELECTION_END:
+        // Only needed for touch selection handles. TODO: port those (upstream
+        // draws PNGs from share/libreofficekit/, often not packaged).
+        break;
+    case LOK_CALLBACK_GRAPHIC_SELECTION:
+        // Payload may carry extra fields (angle, handles JSON); only the rectangle is used.
+        // TODO: dragging handles via setGraphicSelection() like upstream, unless
+        // plain mouse events on the handle positions turn out to be enough.
+        priv->m_aGraphicSelection = payloadToRectangle(priv, pPayload);
+        gtk_widget_queue_draw(GTK_WIDGET(pDocView));
+        break;
+    case LOK_CALLBACK_CELL_CURSOR:
+        priv->m_aCellCursor = payloadToRectangle(priv, pPayload);
+        gtk_widget_queue_draw(GTK_WIDGET(pDocView));
         break;
     case LOK_CALLBACK_CONTENT_CONTROL:
         g_signal_emit(pDocView, doc_view_signals[CONTENT_CONTROL], 0, pPayload);
@@ -766,6 +939,78 @@ static void appendTiles(GtkSnapshot* pSnapshot, const TileBuffer& rTiles, float 
     }
 }
 
+static void appendRectangleOutline(GtkSnapshot* pSnapshot, const graphene_rect_t& rRect, float fWidth, const GdkRGBA& rColor)
+{
+    GskRoundedRect aRounded;
+    gsk_rounded_rect_init_from_rect(&aRounded, &rRect, 0);
+    const float aWidths[4] = { fWidth, fWidth, fWidth, fWidth };
+    const GdkRGBA aColors[4] = { rColor, rColor, rColor, rColor };
+    gtk_snapshot_append_border(pSnapshot, &aRounded, aWidths, aColors);
+}
+
+/**
+ * Draws what LOK leaves out of the tiles: text cursor, text selection,
+ * graphic selection and Calc cell cursor (upstream renderOverlay()).
+ * pSnapshot is in document pixels.
+ *
+ * TODO: other views' cursors/selections, content controls, touch handles.
+ */
+static void appendOverlays(LOKDocView* pDocView, GtkSnapshot* pSnapshot)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    const float fZoom = priv->m_fZoom;
+    auto toPixels = [fZoom](const GdkRectangle& rTwips) {
+        return GRAPHENE_RECT_INIT(twipToPixel(rTwips.x, fZoom), twipToPixel(rTwips.y, fZoom),
+                                  twipToPixel(rTwips.width, fZoom), twipToPixel(rTwips.height, fZoom));
+    };
+
+    // Text selection: blue, 75% transparent (upstream colour).
+    const GdkRGBA aSelectionColor = { 0x43 / 255.0f, 0xac / 255.0f, 0xe8 / 255.0f, 0.25f };
+    for (const GdkRectangle& rRectangle : priv->m_aTextSelectionRectangles)
+    {
+        graphene_rect_t aRect = toPixels(rRectangle);
+        gtk_snapshot_append_color(pSnapshot, &aSelectionColor, &aRect);
+    }
+
+    const GdkRGBA aBlack = { 0, 0, 0, 1 };
+    const GdkRGBA aWhite = { 1, 1, 1, 1 };
+
+    // Calc cell cursor: 2px frame.
+    if (!isEmptyRectangle(priv->m_aCellCursor))
+        appendRectangleOutline(pSnapshot, toPixels(priv->m_aCellCursor), 2, aBlack);
+
+    // Graphic selection: thin frame plus 8 resize handles (9px, not zoomed).
+    if (!isEmptyRectangle(priv->m_aGraphicSelection))
+    {
+        graphene_rect_t aSelection = toPixels(priv->m_aGraphicSelection);
+        appendRectangleOutline(pSnapshot, aSelection, 1, aBlack);
+
+        const float fHandle = 9;
+        for (float fX : { 0.0f, 0.5f, 1.0f })
+        {
+            for (float fY : { 0.0f, 0.5f, 1.0f })
+            {
+                if (fX == 0.5f && fY == 0.5f)
+                    continue;
+                graphene_rect_t aHandle = GRAPHENE_RECT_INIT(
+                    aSelection.origin.x + aSelection.size.width * fX - fHandle / 2,
+                    aSelection.origin.y + aSelection.size.height * fY - fHandle / 2, fHandle, fHandle);
+                gtk_snapshot_append_color(pSnapshot, &aWhite, &aHandle);
+                appendRectangleOutline(pSnapshot, aHandle, 1, aBlack);
+            }
+        }
+    }
+
+    // Own text cursor; LOK reports width 0, give it a minimum like upstream (30 twips).
+    if (isCursorShown(pDocView) && priv->m_bCursorBlinkOn)
+    {
+        GdkRectangle aCursor = priv->m_aVisibleCursor;
+        aCursor.width = std::max(aCursor.width, 30);
+        graphene_rect_t aRect = toPixels(aCursor);
+        gtk_snapshot_append_color(pSnapshot, &aBlack, &aRect);
+    }
+}
+
 static void lok_doc_view_snapshot(GtkWidget* pWidget, GtkSnapshot* pSnapshot)
 {
     LOKDocView* pDocView = LOK_DOC_VIEW(pWidget);
@@ -834,12 +1079,10 @@ static void lok_doc_view_snapshot(GtkWidget* pWidget, GtkSnapshot* pSnapshot)
     if (bComplete)
         priv->m_pPreviousTiles.reset();
 
+    appendOverlays(pDocView, pSnapshot);
+
     gtk_snapshot_pop(pSnapshot);
     gtk_snapshot_restore(pSnapshot);
-
-    // TODO: overlays (cursor, selections, handles, graphic selection, other
-    // views) — upstream renderOverlay(); use gtk_snapshot_append_color() or
-    // gtk_snapshot_append_cairo().
 }
 
 static void lok_doc_view_measure(GtkWidget* pWidget, GtkOrientation eOrientation, int /*nForSize*/,
@@ -1198,6 +1441,13 @@ static void lok_doc_view_init (LOKDocView* pDocView)
     g_signal_connect(pKey, "key-released", G_CALLBACK(onKeyReleased), pDocView);
     gtk_widget_add_controller(pWidget, pKey);
 
+    // The cursor is only shown (and blinks) while focused.
+    GtkEventController* pFocus = gtk_event_controller_focus_new();
+    priv->m_pFocusController = GTK_EVENT_CONTROLLER_FOCUS(pFocus);
+    g_signal_connect_swapped(pFocus, "enter", G_CALLBACK(restartCursorBlink), pDocView);
+    g_signal_connect_swapped(pFocus, "leave", G_CALLBACK(restartCursorBlink), pDocView);
+    gtk_widget_add_controller(pWidget, pFocus);
+
     g_signal_connect(pDocView, "notify::scale-factor", G_CALLBACK(onScaleFactorChanged), nullptr);
 }
 
@@ -1361,6 +1611,9 @@ static void lok_doc_view_dispose (GObject* object)
         g_debug("dispose: start");
         priv->m_bDisposed = true;
         g_weak_ref_set(&priv->m_pHandle->m_aView, nullptr);
+        g_clear_handle_id(&priv->m_nBlinkTimeoutId, g_source_remove);
+        // GtkWidget's dispose frees the controllers.
+        priv->m_pFocusController = nullptr;
 
         // Stop painting before the document goes away: drop queued requests
         // and wait for the running one. Must not hold g_aLOKMutex here, the
@@ -2516,7 +2769,14 @@ lok_doc_view_reset_view(LOKDocView* pDocView)
     priv->m_nMouseButtons = 0;
     priv->m_nClickCount = 0;
     priv->m_nLastPressTime = 0;
-    // TODO: reset cursor/selection/handle overlay state once ported.
+
+    // Nothing is drawn until LOK reports a new cursor position anyway.
+    priv->m_aVisibleCursor = {};
+    priv->m_bCursorVisible = true;
+    priv->m_aTextSelectionRectangles.clear();
+    priv->m_aGraphicSelection = {};
+    priv->m_aCellCursor = {};
+    restartCursorBlink(pDocView); // stops it: no cursor
 
     gtk_widget_queue_draw(GTK_WIDGET(pDocView));
 }
@@ -2544,6 +2804,7 @@ lok_doc_view_set_edit(LOKDocView* pDocView,
         g_info("lok_doc_view_set_edit: entering edit mode");
 
     priv->m_bEdit = bEdit;
+    restartCursorBlink(pDocView); // the cursor is only shown in edit mode
     // NB: the GTK3 widget emitted the *old* value here, contrary to its docs.
     g_signal_emit(pDocView, doc_view_signals[EDIT_CHANGED], 0, bEdit);
     g_object_notify_by_pspec(G_OBJECT(pDocView), properties[PROP_EDITABLE]);
