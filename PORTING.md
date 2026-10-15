@@ -81,6 +81,9 @@ Done:
     such tiles become requestable again.
   - The cache is bounded to ~3× the wanted area (min 64 tiles), evicting the tiles farthest from
     the viewport center (not those with a paint in flight).
+  - Part-aware invalidation (Calc/Impress/Draw; Writer has no parts here): invalidations for
+    other parts are skipped. A `LOK_CALLBACK_SET_PART` that changes the part resets the tiles,
+    since the new part's invalidation may have arrived first and been skipped.
 - `src/tilebuffer.*` — texture cache with valid/pending/serial state per tile.
 - Overlays (`appendOverlays()`): own text cursor (blinks per `gtk-cursor-blink*` settings, only
   while focused and in edit mode), text selection, graphic selection frame + 8 handles, Calc cell
@@ -159,7 +162,7 @@ Rendering notes (LibreOffice behaviour, not ours):
 1. Overlays still missing: other views' cursors/selections, content controls, touch selection
    handles (upstream PNGs), dragging graphic handles via `setGraphicSelection()`.
 2. `setClientVisibleArea`; IM `retrieve-surrounding` (needs text around the cursor from LOK).
-3. Part-aware invalidation.
+3. Impress invalidation mode (normal/notes/master) isn't checked yet, only the part.
 4. Comments, multi-view (`new_from_widget`), dialogs; port gtktiledviewer as test app.
 5. Clipboard leftovers: primary selection (middle-click paste), lazy export (only convert the
    formats another app actually requests).

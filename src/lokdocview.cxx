@@ -141,6 +141,7 @@ struct LOKDocViewPrivateImpl
     LibreOfficeKitDocument* m_pDocument = nullptr;
     int m_nViewId = 0;
     int m_eTileMode = LOK_TILEMODE_BGRA;
+    int m_eDocumentType = LOK_DOCTYPE_OTHER;
 
     long m_nDocumentWidthTwips = 0;
     long m_nDocumentHeightTwips = 0;
@@ -889,31 +890,57 @@ static void handleCommandResult(LOKDocView* pDocView, const std::string& rPayloa
 // ---------------------------------------------------------------------------
 
 /// Parses the leading "x, y, width, height" of a payload; LOK appends extra fields to some.
-static bool parseRectangle(const char* p, GdkRectangle& rRect)
+/// Parses a leading list of comma-separated integers; stops at anything else.
+static std::vector<long> parseNumbers(const char* p)
 {
-    long aValues[4];
-    for (long& rValue : aValues)
+    std::vector<long> aNumbers;
+    for (;;)
     {
-        char* pEnd = nullptr;
-        rValue = std::strtol(p, &pEnd, 10);
-        if (pEnd == p)
-            return false;
-        p = pEnd;
         while (*p == ',' || *p == ' ')
             ++p;
+        char* pEnd = nullptr;
+        long nValue = std::strtol(p, &pEnd, 10);
+        if (pEnd == p)
+            break;
+        aNumbers.push_back(nValue);
+        p = pEnd;
     }
-    rRect = { static_cast<int>(std::min<long>(aValues[0], INT_MAX)),
-              static_cast<int>(std::min<long>(aValues[1], INT_MAX)),
-              static_cast<int>(std::min<long>(aValues[2], INT_MAX)),
-              static_cast<int>(std::min<long>(aValues[3], INT_MAX)) };
+    return aNumbers;
+}
+
+static GdkRectangle toRectangle(const std::vector<long>& rNumbers)
+{
+    auto toInt = [](long n) { return static_cast<int>(std::clamp<long>(n, INT_MIN, INT_MAX)); };
+    return { toInt(rNumbers[0]), toInt(rNumbers[1]), toInt(rNumbers[2]), toInt(rNumbers[3]) };
+}
+
+/// Parses the leading "x, y, width, height" of a payload; LOK appends extra fields to some.
+static bool parseRectangle(const char* p, GdkRectangle& rRect)
+{
+    std::vector<long> aNumbers = parseNumbers(p);
+    if (aNumbers.size() < 4)
+        return false;
+    rRect = toRectangle(aNumbers);
     return true;
 }
 
-/// Parses "x, y, width, height[, part[, mode]]" (twips) or "EMPTY[, part[, mode]]".
-static bool parseInvalidation(const std::string& rPayload, GdkRectangle& rRect, bool& rbAll)
+/**
+ * Parses "x, y, width, height[, part[, mode]]" (twips) or
+ * "EMPTY[, part[, mode]]". rnPart is -1 if the payload has none.
+ */
+static bool parseInvalidation(const std::string& rPayload, GdkRectangle& rRect, bool& rbAll, int& rnPart)
 {
     rbAll = rPayload.compare(0, 5, "EMPTY") == 0;
-    return rbAll || parseRectangle(rPayload.c_str(), rRect);
+    std::vector<long> aNumbers = parseNumbers(rPayload.c_str() + (rbAll ? 5 : 0));
+    size_t nPartIndex = rbAll ? 0 : 4;
+    if (!rbAll)
+    {
+        if (aNumbers.size() < 4)
+            return false;
+        rRect = toRectangle(aNumbers);
+    }
+    rnPart = aNumbers.size() > nPartIndex ? static_cast<int>(aNumbers[nPartIndex]) : -1;
+    return true;
 }
 
 static bool isEmptyRectangle(const GdkRectangle& rRect)
@@ -1049,14 +1076,20 @@ static void invalidateTiles(LOKDocView* pDocView, const std::string& rPayload)
     LOKDocViewPrivate& priv = getPrivate(pDocView);
     GdkRectangle aTwips;
     bool bAll;
-    if (!parseInvalidation(rPayload, aTwips, bAll))
+    int nPart;
+    if (!parseInvalidation(rPayload, aTwips, bAll, nPart))
     {
         g_warning("invalidateTiles: unexpected payload '%s'", rPayload.c_str());
         return;
     }
 
-    // TODO: honour the part number (LOK_FEATURE_PART_IN_INVALIDATION_CALLBACK)
-    // and skip invalidations for other parts.
+    // With LOK_FEATURE_PART_IN_INVALIDATION_CALLBACK, skip changes on other
+    // sheets/slides: our tiles only show the current one. Writer has no
+    // parts in this sense. (A negative part means all parts.)
+    // TODO: Impress also sends a mode (normal/notes/master), not checked yet.
+    if (nPart >= 0 && priv->m_eDocumentType != LOK_DOCTYPE_TEXT && nPart != priv->m_nPartId)
+        return;
+
     if (bAll)
         priv->m_pTileBuffer->invalidateAll();
     else
@@ -1086,6 +1119,8 @@ static int countSearchResults(const std::string& rPayload)
     JsonArray* pResults = json_object_get_array_member(json_node_get_object(pRoot), "searchResultSelection");
     return pResults ? json_array_get_length(pResults) : 0;
 }
+
+static void startNewTileGeneration(LOKDocView* pDocView, bool bKeepAsPlaceholder);
 
 static void handleCallback(LOKDocView* pDocView, CallbackEvent* pEvent)
 {
@@ -1128,9 +1163,17 @@ static void handleCallback(LOKDocView* pDocView, CallbackEvent* pEvent)
                       std::to_string(countSearchResults(rPayload)).c_str());
         break;
     case LOK_CALLBACK_SET_PART:
-        priv->m_nPartId = std::atoi(pPayload);
+    {
+        int nPart = std::atoi(pPayload);
+        // LOK switched part itself (e.g. Ctrl+PageDown in Calc): the tiles
+        // show the old one. Don't rely on an invalidation for the new part,
+        // it may have arrived before this and been skipped as "other part".
+        if (nPart != priv->m_nPartId && priv->m_eDocumentType != LOK_DOCTYPE_TEXT)
+            startNewTileGeneration(pDocView, false);
+        priv->m_nPartId = nPart;
         g_signal_emit(pDocView, doc_view_signals[PART_CHANGED], 0, priv->m_nPartId);
         break;
+    }
     case LOK_CALLBACK_UNO_COMMAND_RESULT:
         handleCommandResult(pDocView, rPayload);
         break;
@@ -2192,6 +2235,7 @@ static void postDocumentLoad(LOKDocView* pDocView)
         priv->m_nViewId = pDocument->pClass->getView(pDocument);
         pDocument->pClass->registerCallback(pDocument, lokCallback, priv->m_pHandle);
         priv->m_eTileMode = pDocument->pClass->getTileMode(pDocument);
+        priv->m_eDocumentType = pDocument->pClass->getDocumentType(pDocument);
         priv->m_nParts = pDocument->pClass->getParts(pDocument);
         priv->m_nPartId = pDocument->pClass->getPart(pDocument);
     }
