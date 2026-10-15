@@ -41,6 +41,8 @@ typedef struct
     GtkWidget* pProgress;
     GtkWidget* pStatus;
     GtkWidget* pBoundaries;
+    /// Opens another view of the document (enabled once it's loaded).
+    GtkWidget* pNewView;
     GtkWidget* aFormatButtons[FORMAT_COMMAND_COUNT];
     /// Sheet/slide selector (Calc, Impress, Draw).
     GtkWidget* pParts;
@@ -288,6 +290,26 @@ static void onHyperlinkClicked(LOKDocView* pDocView, const gchar* pURI, gpointer
     g_object_unref(pLauncher);
 }
 
+/// The view has a document: after loading, or right away for a new view.
+static void onDocumentReady(DemoWindow* pWindow)
+{
+    gtk_widget_set_visible(pWindow->pProgress, FALSE);
+    setStatus(pWindow, "Loaded");
+    gtk_widget_set_sensitive(pWindow->pNewView, TRUE);
+    // The profile remembers the last state; make the view match the toggle.
+    applyBoundaries(pWindow);
+
+    // Sheets/slides: Writer's "parts" (pages) aren't something to switch to.
+    // getDocumentType() doesn't depend on the view, so calling LOK directly
+    // here is fine.
+    LibreOfficeKitDocument* pDocument = lok_doc_view_get_document(pWindow->pDocView);
+    if (pDocument->pClass->getDocumentType(pDocument) != LOK_DOCTYPE_TEXT)
+    {
+        gtk_widget_set_visible(pWindow->pParts, TRUE);
+        refreshParts(pWindow);
+    }
+}
+
 /// pData: a heap GWeakRef to the toplevel, which may be gone by now.
 static void onDocumentOpened(GObject* pSource, GAsyncResult* pResult, gpointer pData)
 {
@@ -313,23 +335,13 @@ static void onDocumentOpened(GObject* pSource, GAsyncResult* pResult, gpointer p
         g_clear_error(&pError);
         return;
     }
-    gtk_widget_set_visible(pWindow->pProgress, FALSE);
-    setStatus(pWindow, "Loaded");
-    // The profile remembers the last state; make the view match the toggle.
-    applyBoundaries(pWindow);
-
-    // Sheets/slides: Writer's "parts" (pages) aren't something to switch to.
-    // getDocumentType() doesn't depend on the view, so calling LOK directly
-    // here is fine.
-    LibreOfficeKitDocument* pDocument = lok_doc_view_get_document(pWindow->pDocView);
-    if (pDocument->pClass->getDocumentType(pDocument) != LOK_DOCTYPE_TEXT)
-    {
-        gtk_widget_set_visible(pWindow->pParts, TRUE);
-        refreshParts(pWindow);
-    }
+    onDocumentReady(pWindow);
 }
 
 // --- Window --------------------------------------------------------------
+
+// Defined after createWindow(), which it uses; createHeaderBar() connects it.
+static void onNewView(GtkButton* pButton, DemoWindow* pWindow);
 
 static GtkWidget* createFindBar(DemoWindow* pWindow)
 {
@@ -432,6 +444,12 @@ static GtkWidget* createHeaderBar(DemoWindow* pWindow)
     g_signal_connect(pWindow->pBoundaries, "toggled", G_CALLBACK(onBoundariesToggled), pWindow);
     gtk_header_bar_pack_end(GTK_HEADER_BAR(pHeader), pWindow->pBoundaries);
 
+    pWindow->pNewView = gtk_button_new_from_icon_name("window-new-symbolic");
+    gtk_widget_set_tooltip_text(pWindow->pNewView, "New view of this document");
+    gtk_widget_set_sensitive(pWindow->pNewView, FALSE); // until loaded
+    g_signal_connect(pWindow->pNewView, "clicked", G_CALLBACK(onNewView), pWindow);
+    gtk_header_bar_pack_end(GTK_HEADER_BAR(pHeader), pWindow->pNewView);
+
     GtkWidget* pFind = gtk_toggle_button_new();
     gtk_button_set_icon_name(GTK_BUTTON(pFind), "edit-find-symbolic");
     gtk_widget_set_tooltip_text(pFind, "Find (Ctrl+F)");
@@ -442,25 +460,23 @@ static GtkWidget* createHeaderBar(DemoWindow* pWindow)
     return pHeader;
 }
 
-static void openWindow(GtkApplication* pApp, GFile* pFile)
+/// Rendering arguments giving each view its own author (change tracking,
+/// comments); views are numbered in the order they're created.
+static char* getRenderingArguments(void)
 {
-    GError* pError = NULL;
-    g_autofree char* pProfileURL = getUserProfileURL();
-    GtkWidget* pDocView = lok_doc_view_new_from_user_profile(g_pLOPath, pProfileURL, NULL, &pError);
-    if (!pDocView)
-    {
-        g_printerr("%s\n", pError->message);
-        g_clear_error(&pError);
-        return;
-    }
+    static int nViews = 0;
+    return g_strdup_printf("{\".uno:Author\":{\"type\":\"string\",\"value\":\"View %d\"}}", ++nViews);
+}
 
+/// A window around pDocView, with the document's signals connected.
+static GtkWidget* createWindow(GtkApplication* pApp, const char* pTitle, GtkWidget* pDocView)
+{
     DemoWindow* pWindow = g_new0(DemoWindow, 1);
     pWindow->pDocView = LOK_DOC_VIEW(pDocView);
 
     GtkWidget* pAppWindow = gtk_application_window_new(pApp);
     g_object_set_data_full(G_OBJECT(pAppWindow), "demo-window", pWindow, g_free);
-    g_autofree char* pBasename = g_file_get_basename(pFile);
-    gtk_window_set_title(GTK_WINDOW(pAppWindow), pBasename);
+    gtk_window_set_title(GTK_WINDOW(pAppWindow), pTitle);
     gtk_window_set_default_size(GTK_WINDOW(pAppWindow), 1000, 800);
 
     GtkWidget* pFindBar = createFindBar(pWindow); // before the header bar, which binds to it
@@ -503,13 +519,43 @@ static void openWindow(GtkApplication* pApp, GFile* pFile)
     g_signal_connect_object(pDocView, "formula-changed", G_CALLBACK(onFormulaChanged), pAppWindow, 0);
     g_signal_connect(pDocView, "hyperlink-clicked", G_CALLBACK(onHyperlinkClicked), NULL);
 
+    gtk_window_present(GTK_WINDOW(pAppWindow));
+    gtk_widget_grab_focus(pDocView);
+    return pAppWindow;
+}
+
+static void openWindow(GtkApplication* pApp, GFile* pFile)
+{
+    GError* pError = NULL;
+    g_autofree char* pProfileURL = getUserProfileURL();
+    GtkWidget* pDocView = lok_doc_view_new_from_user_profile(g_pLOPath, pProfileURL, NULL, &pError);
+    if (!pDocView)
+    {
+        g_printerr("%s\n", pError->message);
+        g_clear_error(&pError);
+        return;
+    }
+
+    g_autofree char* pBasename = g_file_get_basename(pFile);
+    GtkWidget* pAppWindow = createWindow(pApp, pBasename, pDocView);
+
     GWeakRef* pWindowRef = g_new(GWeakRef, 1);
     g_weak_ref_init(pWindowRef, pAppWindow);
     g_autofree char* pPath = g_file_get_path(pFile);
-    lok_doc_view_open_document(LOK_DOC_VIEW(pDocView), pPath, "{}", NULL, onDocumentOpened, pWindowRef);
+    g_autofree char* pArguments = getRenderingArguments();
+    lok_doc_view_open_document(LOK_DOC_VIEW(pDocView), pPath, pArguments, NULL, onDocumentOpened, pWindowRef);
+}
 
-    gtk_window_present(GTK_WINDOW(pAppWindow));
-    gtk_widget_grab_focus(pDocView);
+/// Another view of the same document in a new window, with its own cursor,
+/// selection, part and edit mode.
+static void onNewView(GtkButton* pButton, DemoWindow* pWindow)
+{
+    GtkWindow* pAppWindow = GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(pButton)));
+    g_autofree char* pArguments = getRenderingArguments();
+    GtkWidget* pDocView = lok_doc_view_new_from_widget(pWindow->pDocView, pArguments);
+    g_autofree char* pTitle = g_strdup_printf("%s (new view)", gtk_window_get_title(pAppWindow));
+    GtkWidget* pNewWindow = createWindow(gtk_window_get_application(pAppWindow), pTitle, pDocView);
+    onDocumentReady(getDemoWindow(pNewWindow));
 }
 
 static void onOpen(GApplication* pApp, GFile** pFiles, gint nFiles, const gchar* pHint, gpointer pData)
@@ -534,8 +580,7 @@ int main(int argc, char** argv)
     GtkApplication* pApp = gtk_application_new("org.libreoffice.LOKDocView4Demo",
                                                G_APPLICATION_HANDLES_OPEN | G_APPLICATION_NON_UNIQUE);
     const GOptionEntry aEntries[] = {
-        { "lo-path", 0, 0, G_OPTION_ARG_FILENAME, &g_pLOPath, "LibreOffice program directory (default: auto-detect)", "DIR" },
-        { NULL, 0, 0, 0, NULL, NULL, NULL },
+        { "lo-path", 0, 0, G_OPTION_ARG_FILENAME, &g_pLOPath, "LibreOffice program directory (default: auto-detect)", "DIR" },        { NULL, 0, 0, 0, NULL, NULL, NULL },
     };
     g_application_add_main_option_entries(G_APPLICATION(pApp), aEntries);
     g_signal_connect(pApp, "open", G_CALLBACK(onOpen), NULL);

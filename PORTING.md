@@ -135,7 +135,15 @@ Done:
   (`post_command` + state via `command-changed`), sheet/slide selector (`get_parts`/`get_part_name`/
   `set_part`/`part-changed`), find bar (Ctrl+F; `find_next`/`find_prev`/`highlight_all`,
   `search-not-found`, `search-result-count`), Calc cell address + formula (`address-changed`,
-  `formula-changed`). Covers the commonly used parts of gtktiledviewer.
+  `formula-changed`), "new view" button (`new_from_widget`, own window, own author via
+  `.uno:Author` rendering argument). Covers the commonly used parts of gtktiledviewer.
+- Multi-view: other views' cursors (non-blinking, also in view-only mode), text selections, cell
+  cursors and graphic selections are drawn in per-view colours, each only on the part it's on
+  (except Writer). LOK doesn't reliably notify a view's destruction, but all views of a document
+  live in this process: a disposed view drops itself from its siblings (`g_aLiveViews`), and
+  callbacks about view ids that aren't live are ignored. Each view's visible area (twips) is sent
+  with `setClientVisibleArea` when it changes, batched with `setClientZoom` in a low-priority idle;
+  `lok_doc_view_set_visible_area()` overrides it until the viewport next changes.
 - Upstream's vcl/awt/boost deps replaced: local `MOUSE_*`/`KEY_*`/`AwtKey` constants, json-glib.
 
 Deliberate deviations from GTK3 widget:
@@ -169,11 +177,11 @@ Rendering notes (LibreOffice behaviour, not ours):
   thread under `g_aLOKMutex`, so they can wait for at most one in-flight tile paint.
 
 ## Next steps
-1. Overlays still missing: other views' cursors/selections, content controls, touch selection
-   handles (upstream PNGs), dragging graphic handles via `setGraphicSelection()`.
-2. `setClientVisibleArea`; IM `retrieve-surrounding` (needs text around the cursor from LOK).
+1. Overlays still missing: content controls, touch selection handles (upstream PNGs), dragging
+   graphic handles via `setGraphicSelection()`.
+2. IM `retrieve-surrounding` (needs text around the cursor from LOK).
 3. Impress invalidation mode (normal/notes/master) isn't checked yet, only the part.
-4. Comments, multi-view (`new_from_widget`, plus a "new view" button in the demo), dialogs.
+4. Comments, dialogs, view lock (`LOK_CALLBACK_VIEW_LOCK`).
 5. Clipboard leftover: lazy export (only convert the formats another app actually requests).
 
 ## TODO upstream (LibreOffice)

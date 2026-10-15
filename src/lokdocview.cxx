@@ -120,6 +120,29 @@ struct ViewHandle
     int m_nWantedRowEnd = INT_MAX;
 };
 
+/**
+ * Views with a document, main thread only. LOK doesn't reliably tell the
+ * other views when a view is destroyed, but within this process every view
+ * is a LOKDocView: a disposed view tells its siblings directly.
+ */
+std::vector<LOKDocView*> g_aLiveViews;
+
+/// What another view of the same document shows us of itself (twips).
+/// Each item carries the part it is on: only drawn on the current one
+/// (except in Writer).
+struct OtherView
+{
+    GdkRectangle m_aCursor = {};
+    int m_nCursorPart = 0;
+    bool m_bCursorVisible = true;
+    std::vector<GdkRectangle> m_aSelection;
+    int m_nSelectionPart = 0;
+    GdkRectangle m_aCellCursor = {};
+    int m_nCellCursorPart = 0;
+    GdkRectangle m_aGraphicSelection = {};
+    int m_nGraphicSelectionPart = 0;
+};
+
 /// A LOK callback marshalled to the main loop.
 struct CallbackEvent
 {
@@ -177,8 +200,13 @@ struct LOKDocViewPrivateImpl
     int m_nParts = 0;
     int m_nPartId = 0;
 
+    /// Visible document area in twips, as last computed in snapshot (or set
+    /// via lok_doc_view_set_visible_area()), and as last sent to LOK.
     GdkRectangle m_aVisibleArea = {};
-    bool m_bVisibleAreaSet = false;
+    GdkRectangle m_aSentVisibleArea = {};
+
+    /// Cursors and selections of the document's other views, by view id.
+    std::map<int, OtherView> m_aOtherViews;
 
     GtkAdjustment* m_pHAdjustment = nullptr;
     GtkAdjustment* m_pVAdjustment = nullptr;
@@ -199,8 +227,9 @@ struct LOKDocViewPrivateImpl
     double m_fAnchorY = 0;
     double m_fAnchorDocX = 0;
     double m_fAnchorDocY = 0;
-    /// Coalesced setClientZoom(), see scheduleClientZoomUpdate().
-    guint m_nClientZoomIdleId = 0;
+    /// Coalesced setClientZoom()/setClientVisibleArea(), see scheduleClientViewUpdate().
+    guint m_nClientViewIdleId = 0;
+    bool m_bClientZoomDirty = false;
     float m_fPinchStartZoom = 1.0f;
     /// Last pointer position over the widget, for Ctrl+scroll zoom.
     bool m_bPointerKnown = false;
@@ -1166,6 +1195,82 @@ static int countSearchResults(const std::string& rPayload)
 
 static void startNewTileGeneration(LOKDocView* pDocView, bool bKeepAsPlaceholder);
 
+/// JSON member as int; LOK sends ids as strings ("viewId": "1") or numbers.
+static int getIntMember(JsonObject* pObject, const char* pName, int nDefault)
+{
+    JsonNode* pNode = json_object_get_member(pObject, pName);
+    if (!pNode || !JSON_NODE_HOLDS_VALUE(pNode))
+        return nDefault;
+    if (json_node_get_value_type(pNode) == G_TYPE_STRING)
+        return std::atoi(json_node_get_string(pNode));
+    return static_cast<int>(json_node_get_int(pNode));
+}
+
+/// JSON member as bool; LOK sends "true"/"false" strings or booleans.
+static bool getBoolMember(JsonObject* pObject, const char* pName, bool bDefault)
+{
+    JsonNode* pNode = json_object_get_member(pObject, pName);
+    if (!pNode || !JSON_NODE_HOLDS_VALUE(pNode))
+        return bDefault;
+    if (json_node_get_value_type(pNode) == G_TYPE_STRING)
+        return g_strcmp0(json_node_get_string(pNode), "true") == 0;
+    return json_node_get_boolean(pNode);
+}
+
+/**
+ * Another view's cursor/selection callbacks: {"viewId": ..., "part": ...,
+ * "rectangle"/"selection"/"visible": ...}. LOK doesn't reliably tell us when
+ * a view goes away; see dropOtherView().
+ */
+static void handleOtherViewCallback(LOKDocView* pDocView, int nType, const std::string& rPayload)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    g_autoptr(JsonParser) pParser = json_parser_new();
+    if (!json_parser_load_from_data(pParser, rPayload.c_str(), -1, nullptr)
+        || !JSON_NODE_HOLDS_OBJECT(json_parser_get_root(pParser)))
+        return;
+    JsonObject* pObject = json_node_get_object(json_parser_get_root(pParser));
+    int nViewId = getIntMember(pObject, "viewId", -1);
+    if (nViewId < 0 || nViewId == priv->m_nViewId)
+        return;
+    // Ignore late callbacks about a view that is gone already (it was
+    // dropped from m_aOtherViews on dispose and must not come back).
+    bool bLive = std::any_of(g_aLiveViews.begin(), g_aLiveViews.end(), [&priv, nViewId](LOKDocView* pView) {
+        LOKDocViewPrivate& rView = getPrivate(pView);
+        return rView->m_pDocument == priv->m_pDocument && rView->m_nViewId == nViewId;
+    });
+    if (!bLive)
+        return;
+
+    OtherView& rView = priv->m_aOtherViews[nViewId];
+    int nPart = getIntMember(pObject, "part", 0);
+    const char* pRectangle = json_object_get_string_member_with_default(pObject, "rectangle", "EMPTY");
+    const char* pSelection = json_object_get_string_member_with_default(pObject, "selection", "EMPTY");
+    switch (nType)
+    {
+    case LOK_CALLBACK_INVALIDATE_VIEW_CURSOR:
+        rView.m_aCursor = payloadToRectangle(priv, pRectangle);
+        rView.m_nCursorPart = nPart;
+        break;
+    case LOK_CALLBACK_VIEW_CURSOR_VISIBLE:
+        rView.m_bCursorVisible = getBoolMember(pObject, "visible", true);
+        break;
+    case LOK_CALLBACK_TEXT_VIEW_SELECTION:
+        rView.m_aSelection = payloadToRectangles(priv, pSelection);
+        rView.m_nSelectionPart = nPart;
+        break;
+    case LOK_CALLBACK_CELL_VIEW_CURSOR:
+        rView.m_aCellCursor = payloadToRectangle(priv, pRectangle);
+        rView.m_nCellCursorPart = nPart;
+        break;
+    case LOK_CALLBACK_GRAPHIC_VIEW_SELECTION:
+        rView.m_aGraphicSelection = payloadToRectangle(priv, pSelection);
+        rView.m_nGraphicSelectionPart = nPart;
+        break;
+    }
+    gtk_widget_queue_draw(GTK_WIDGET(pDocView));
+}
+
 static void handleCallback(LOKDocView* pDocView, CallbackEvent* pEvent)
 {
     LOKDocViewPrivate& priv = getPrivate(pDocView);
@@ -1260,6 +1365,13 @@ static void handleCallback(LOKDocView* pDocView, CallbackEvent* pEvent)
         break;
     case LOK_CALLBACK_CLIPBOARD_CHANGED:
         exportClipboard(pDocView);
+        break;
+    case LOK_CALLBACK_INVALIDATE_VIEW_CURSOR:
+    case LOK_CALLBACK_VIEW_CURSOR_VISIBLE:
+    case LOK_CALLBACK_TEXT_VIEW_SELECTION:
+    case LOK_CALLBACK_CELL_VIEW_CURSOR:
+    case LOK_CALLBACK_GRAPHIC_VIEW_SELECTION:
+        handleOtherViewCallback(pDocView, pEvent->m_nType, rPayload);
         break;
     case LOK_CALLBACK_MOUSE_POINTER:
         // CSS cursor names ("text", "pointer", "move", ...), as GTK4 takes them;
@@ -1513,6 +1625,7 @@ static void appendTiles(GtkSnapshot* pSnapshot, const TileBuffer& rTiles, float 
 }
 
 static void updateIMCursorLocation(LOKDocView* pDocView);
+static void scheduleClientViewUpdate(LOKDocView* pDocView);
 
 /**
  * Queues paints for missing or stale tiles, given the visible tile range
@@ -1575,12 +1688,47 @@ static void appendRectangleOutline(GtkSnapshot* pSnapshot, const graphene_rect_t
     gtk_snapshot_append_border(pSnapshot, &aRounded, aWidths, aColors);
 }
 
+/// Thin frame plus 8 resize handles (9px, not zoomed).
+static void appendGraphicSelection(GtkSnapshot* pSnapshot, const graphene_rect_t& rSelection, const GdkRGBA& rColor)
+{
+    const GdkRGBA aWhite = { 1, 1, 1, 1 };
+    appendRectangleOutline(pSnapshot, rSelection, 1, rColor);
+
+    const float fHandle = 9;
+    for (float fX : { 0.0f, 0.5f, 1.0f })
+    {
+        for (float fY : { 0.0f, 0.5f, 1.0f })
+        {
+            if (fX == 0.5f && fY == 0.5f)
+                continue;
+            graphene_rect_t aHandle = GRAPHENE_RECT_INIT(
+                rSelection.origin.x + rSelection.size.width * fX - fHandle / 2,
+                rSelection.origin.y + rSelection.size.height * fY - fHandle / 2, fHandle, fHandle);
+            gtk_snapshot_append_color(pSnapshot, &aWhite, &aHandle);
+            appendRectangleOutline(pSnapshot, aHandle, 1, rColor);
+        }
+    }
+}
+
+/// Per-view colour, by view id: modelled on LibreOffice's dark author
+/// colours, minus the blues, which looked like our own selection.
+static GdkRGBA getViewColor(int nViewId, float fAlpha)
+{
+    static const guint8 aColors[][3] = { { 198, 146, 0 },  { 87, 157, 28 }, { 105, 43, 157 },
+                                         { 197, 0, 11 },   { 0, 128, 128 }, { 140, 132, 0 },
+                                         { 209, 118, 0 } };
+    const guint8* pColor = aColors[static_cast<unsigned>(nViewId) % G_N_ELEMENTS(aColors)];
+    return { pColor[0] / 255.0f, pColor[1] / 255.0f, pColor[2] / 255.0f, fAlpha };
+}
+
 /**
  * Draws what LOK leaves out of the tiles: text cursor, text selection,
  * graphic selection and Calc cell cursor (upstream renderOverlay()).
  * pSnapshot is in document pixels.
  *
- * TODO: other views' cursors/selections, content controls, touch handles.
+ * Also other views' cursors and selections, in per-view colours.
+ *
+ * TODO: content controls, touch handles.
  */
 static void appendOverlays(LOKDocView* pDocView, GtkSnapshot* pSnapshot)
 {
@@ -1591,6 +1739,37 @@ static void appendOverlays(LOKDocView* pDocView, GtkSnapshot* pSnapshot)
                                   twipToPixel(rTwips.width, fZoom), twipToPixel(rTwips.height, fZoom));
     };
 
+    // Other views first, so our own selection and cursor stay on top. Each
+    // item only on the part it is on, except in Writer.
+    auto isOnCurrentPart = [&priv](int nPart) {
+        return priv->m_eDocumentType == LOK_DOCTYPE_TEXT || nPart == priv->m_nPartId;
+    };
+    for (const auto& [nViewId, rView] : priv->m_aOtherViews)
+    {
+        const GdkRGBA aColor = getViewColor(nViewId, 1);
+        if (isOnCurrentPart(rView.m_nSelectionPart))
+        {
+            const GdkRGBA aTranslucent = getViewColor(nViewId, 0.25f);
+            for (const GdkRectangle& rRectangle : rView.m_aSelection)
+            {
+                graphene_rect_t aRect = toPixels(rRectangle);
+                gtk_snapshot_append_color(pSnapshot, &aTranslucent, &aRect);
+            }
+        }
+        if (!isEmptyRectangle(rView.m_aCellCursor) && isOnCurrentPart(rView.m_nCellCursorPart))
+            appendRectangleOutline(pSnapshot, toPixels(rView.m_aCellCursor), 2, aColor);
+        if (!isEmptyRectangle(rView.m_aGraphicSelection) && isOnCurrentPart(rView.m_nGraphicSelectionPart))
+            appendGraphicSelection(pSnapshot, toPixels(rView.m_aGraphicSelection), aColor);
+        // Other views' cursors don't blink (upstream), and show in view-only mode too.
+        if (rView.m_bCursorVisible && !isEmptyRectangle(rView.m_aCursor) && isOnCurrentPart(rView.m_nCursorPart))
+        {
+            GdkRectangle aCursor = rView.m_aCursor;
+            aCursor.width = std::max(aCursor.width, 30);
+            graphene_rect_t aRect = toPixels(aCursor);
+            gtk_snapshot_append_color(pSnapshot, &aColor, &aRect);
+        }
+    }
+
     // Text selection: blue, 75% transparent (upstream colour).
     const GdkRGBA aSelectionColor = { 0x43 / 255.0f, 0xac / 255.0f, 0xe8 / 255.0f, 0.25f };
     for (const GdkRectangle& rRectangle : priv->m_aTextSelectionRectangles)
@@ -1600,33 +1779,13 @@ static void appendOverlays(LOKDocView* pDocView, GtkSnapshot* pSnapshot)
     }
 
     const GdkRGBA aBlack = { 0, 0, 0, 1 };
-    const GdkRGBA aWhite = { 1, 1, 1, 1 };
 
     // Calc cell cursor: 2px frame.
     if (!isEmptyRectangle(priv->m_aCellCursor))
         appendRectangleOutline(pSnapshot, toPixels(priv->m_aCellCursor), 2, aBlack);
 
-    // Graphic selection: thin frame plus 8 resize handles (9px, not zoomed).
     if (!isEmptyRectangle(priv->m_aGraphicSelection))
-    {
-        graphene_rect_t aSelection = toPixels(priv->m_aGraphicSelection);
-        appendRectangleOutline(pSnapshot, aSelection, 1, aBlack);
-
-        const float fHandle = 9;
-        for (float fX : { 0.0f, 0.5f, 1.0f })
-        {
-            for (float fY : { 0.0f, 0.5f, 1.0f })
-            {
-                if (fX == 0.5f && fY == 0.5f)
-                    continue;
-                graphene_rect_t aHandle = GRAPHENE_RECT_INIT(
-                    aSelection.origin.x + aSelection.size.width * fX - fHandle / 2,
-                    aSelection.origin.y + aSelection.size.height * fY - fHandle / 2, fHandle, fHandle);
-                gtk_snapshot_append_color(pSnapshot, &aWhite, &aHandle);
-                appendRectangleOutline(pSnapshot, aHandle, 1, aBlack);
-            }
-        }
-    }
+        appendGraphicSelection(pSnapshot, toPixels(priv->m_aGraphicSelection), aBlack);
 
     // Own text cursor; LOK reports width 0, give it a minimum like upstream (30 twips).
     if (isCursorShown(pDocView) && priv->m_bCursorBlinkOn)
@@ -1700,6 +1859,18 @@ static void lok_doc_view_snapshot(GtkWidget* pWidget, GtkSnapshot* pSnapshot)
     }
     if (bComplete)
         priv->m_pPreviousTiles.reset();
+
+    // Keep LOK informed of what this view shows (twips): it decides e.g.
+    // which other views' cursor invalidations to send based on it.
+    GdkRectangle aVisibleArea = { static_cast<int>(pixelToTwip(fVisLeft, priv->m_fZoom)),
+                                  static_cast<int>(pixelToTwip(fVisTop, priv->m_fZoom)),
+                                  static_cast<int>(pixelToTwip(fVisRight - fVisLeft, priv->m_fZoom)),
+                                  static_cast<int>(pixelToTwip(fVisBottom - fVisTop, priv->m_fZoom)) };
+    if (!gdk_rectangle_equal(&aVisibleArea, &priv->m_aVisibleArea))
+    {
+        priv->m_aVisibleArea = aVisibleArea;
+        scheduleClientViewUpdate(pDocView);
+    }
 
     if (nColStart < nColEnd && nRowStart < nRowEnd)
         requestTiles(pDocView, nColStart, nRowStart, nColEnd, nRowEnd,
@@ -2291,14 +2462,26 @@ static void onFocusChanged(LOKDocView* pDocView)
 // Document loading
 // ---------------------------------------------------------------------------
 
-/// Main-thread setup once documentLoad() succeeded (upstream postDocumentLoad()).
-static void postDocumentLoad(LOKDocView* pDocView)
+/**
+ * Main-thread setup once documentLoad() succeeded, or a view was created
+ * (upstream postDocumentLoad()). nViewId: the view this widget is for, or
+ * -1 after documentLoad() (the document's only view).
+ */
+static void postDocumentLoad(LOKDocView* pDocView, int nViewId)
 {
     LOKDocViewPrivate& priv = getPrivate(pDocView);
     LibreOfficeKitDocument* pDocument = priv->m_pDocument;
 
     {
         std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
+        // initializeForRendering() and registerCallback() act on the current
+        // view, which is global and may have changed since the view was
+        // created (e.g. another view's tile worker painting in between):
+        // select ours explicitly, under the same lock.
+        if (nViewId < 0 && pDocument->pClass->getViewsCount(pDocument) == 1)
+            pDocument->pClass->getViewIds(pDocument, &nViewId, 1);
+        if (nViewId >= 0)
+            pDocument->pClass->setView(pDocument, nViewId);
         pDocument->pClass->initializeForRendering(pDocument, priv->m_aRenderingArguments.c_str());
         // initializeForRendering() may change the view id in Impress, so query it afterwards.
         priv->m_nViewId = pDocument->pClass->getView(pDocument);
@@ -2312,6 +2495,7 @@ static void postDocumentLoad(LOKDocView* pDocView)
     startNewTileGeneration(pDocView, false);
     refreshSize(pDocView);
     updateClientZoom(pDocView);
+    g_aLiveViews.push_back(pDocView);
 
     setIsLoading(pDocView, false);
     priv->m_bInitialized = true;
@@ -2375,7 +2559,7 @@ static void openDocumentDone(GObject* pSource, GAsyncResult* pResult, gpointer p
     }
 
     priv->m_pDocument = pDocument;
-    postDocumentLoad(pDocView);
+    postDocumentLoad(pDocView, -1);
     g_task_return_boolean(pOuterTask, TRUE);
     g_object_unref(pOuterTask);
 }
@@ -2609,7 +2793,7 @@ static void lok_doc_view_dispose (GObject* object)
         g_weak_ref_set(&priv->m_pHandle->m_aView, nullptr);
         g_clear_handle_id(&priv->m_nBlinkTimeoutId, g_source_remove);
         g_clear_handle_id(&priv->m_nHoverRetryId, g_source_remove);
-        g_clear_handle_id(&priv->m_nClientZoomIdleId, g_source_remove);
+        g_clear_handle_id(&priv->m_nClientViewIdleId, g_source_remove);
         g_clear_handle_id(&priv->m_nPrimaryTimeoutId, g_source_remove);
         // Before the document goes: the IM handlers post to it.
         if (priv->m_pIMContext)
@@ -2637,6 +2821,16 @@ static void lok_doc_view_dispose (GObject* object)
             g_debug("dispose: stopping paint worker");
             g_thread_pool_free(priv->m_pPaintPool, /*immediate=*/TRUE, /*wait=*/TRUE);
             priv->m_pPaintPool = nullptr;
+        }
+
+        // Tell the document's other views to drop our cursor and selections.
+        std::erase(g_aLiveViews, pDocView);
+        for (LOKDocView* pOther : g_aLiveViews)
+        {
+            LOKDocViewPrivate& rOther = getPrivate(pOther);
+            if (priv->m_pDocument && rOther->m_pDocument == priv->m_pDocument
+                && rOther->m_aOtherViews.erase(priv->m_nViewId))
+                gtk_widget_queue_draw(GTK_WIDGET(pOther));
         }
 
         std::unique_lock<std::mutex> aGuard(g_aLOKMutex);
@@ -3542,15 +3736,16 @@ LOK_DOC_VIEW_DLLPUBLIC GtkWidget* lok_doc_view_new_from_widget(LOKDocView* pOldL
     // No documentLoad(), just a createView().
     LibreOfficeKitDocument* pDocument = lok_doc_view_get_document(LOK_DOC_VIEW(pNewDocView));
     LOKDocViewPrivate& pNewPriv = getPrivate(LOK_DOC_VIEW(pNewDocView));
+    int nViewId;
     {
-        // Store the view id only later in postDocumentLoad(), as
-        // initializeForRendering() changes the id in Impress.
+        // postDocumentLoad() stores the final id, as initializeForRendering()
+        // changes it in Impress.
         std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
-        pDocument->pClass->createView(pDocument);
+        nViewId = pDocument->pClass->createView(pDocument);
     }
     pNewPriv->m_aRenderingArguments = pRenderingArguments ? pRenderingArguments : "";
 
-    postDocumentLoad(LOK_DOC_VIEW(pNewDocView));
+    postDocumentLoad(LOK_DOC_VIEW(pNewDocView), nViewId);
     return pNewDocView;
 }
 
@@ -3623,10 +3818,11 @@ lok_doc_view_set_visible_area (LOKDocView* pDocView, GdkRectangle* pVisibleArea)
     if (!pVisibleArea)
         return;
 
+    // The widget keeps LOK's visible area in sync with its viewport itself; an
+    // area set here applies until the viewport next changes.
     LOKDocViewPrivate& priv = getPrivate(pDocView);
     priv->m_aVisibleArea = *pVisibleArea;
-    priv->m_bVisibleAreaSet = true;
-    // TODO: pass on via setClientVisibleArea() before the next key event (upstream postKeyEventInThread).
+    scheduleClientViewUpdate(pDocView);
 }
 
 namespace {
@@ -3647,21 +3843,38 @@ bool lok_approxEqual(double a, double b)
 }
 }
 
-static gboolean applyClientZoom(gpointer pData)
+static gboolean applyClientViewState(gpointer pData)
 {
     LOKDocView* pDocView = LOK_DOC_VIEW(pData);
-    getPrivate(pDocView)->m_nClientZoomIdleId = 0;
-    updateClientZoom(pDocView);
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    priv->m_nClientViewIdleId = 0;
+    if (!priv->m_pDocument)
+        return G_SOURCE_REMOVE;
+
+    if (std::exchange(priv->m_bClientZoomDirty, false))
+        updateClientZoom(pDocView);
+
+    const GdkRectangle& rArea = priv->m_aVisibleArea;
+    if (rArea.width > 0 && rArea.height > 0 && !gdk_rectangle_equal(&rArea, &priv->m_aSentVisibleArea))
+    {
+        priv->m_aSentVisibleArea = rArea;
+        std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
+        setDocumentView(priv->m_pDocument, priv->m_nViewId);
+        priv->m_pDocument->pClass->setClientVisibleArea(priv->m_pDocument, rArea.x, rArea.y, rArea.width, rArea.height);
+    }
     return G_SOURCE_REMOVE;
 }
 
-/// setClientZoom() once things settle: a pinch zooms dozens of times a second,
-/// and each call may wait for the LOK mutex behind a tile paint.
-static void scheduleClientZoomUpdate(LOKDocView* pDocView)
+/**
+ * Sends the client zoom (if marked dirty) and visible area to LOK once things
+ * settle: zooming and scrolling change them every frame, and each call may
+ * wait for the LOK mutex behind a tile paint.
+ */
+static void scheduleClientViewUpdate(LOKDocView* pDocView)
 {
     LOKDocViewPrivate& priv = getPrivate(pDocView);
-    if (!priv->m_nClientZoomIdleId)
-        priv->m_nClientZoomIdleId = g_idle_add_full(G_PRIORITY_LOW, applyClientZoom, pDocView, nullptr);
+    if (!priv->m_nClientViewIdleId)
+        priv->m_nClientViewIdleId = g_idle_add_full(G_PRIORITY_LOW, applyClientViewState, pDocView, nullptr);
 }
 
 /**
@@ -3728,7 +3941,8 @@ static void setZoom(LOKDocView* pDocView, float fZoom, double fAnchorX, double f
         g_object_notify_by_pspec(G_OBJECT(pDocView), properties[PROP_CAN_ZOOM_OUT]);
     }
 
-    scheduleClientZoomUpdate(pDocView);
+    priv->m_bClientZoomDirty = true;
+    scheduleClientViewUpdate(pDocView);
 }
 
 LOK_DOC_VIEW_DLLPUBLIC void
