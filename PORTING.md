@@ -177,6 +177,9 @@ Rendering notes (LibreOffice behaviour, not ours):
 5. Clipboard leftover: lazy export (only convert the formats another app actually requests).
 
 ## TODO upstream (LibreOffice)
+- `LibreOfficeKitEnums.h` isn't C-clean with `LOK_USE_UNSTABLE_API`: `lokCallbackTypeToString()`
+  uses `static_cast`/`nullptr`. Our vendored copy wraps it in `#ifdef __cplusplus` (marked
+  "LOKDocView4 local change"); submit the same guard upstream, then drop the local change.
 - Exit-time crash: null-check `gClipboards.get()` in `LOKClipboardFactory::getClipboardForCurView()`
   and in `releaseClipboardForView()`'s clear-all branch (`desktop/source/lib/lokclipboard.cxx`).
   Submit patch + bug report; once released, drop the demo's `_exit()` workaround and return from `main`.

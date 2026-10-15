@@ -1081,6 +1081,9 @@ typedef enum
 }
 LibreOfficeKitExtTextInputType;
 
+// LOKDocView4 local change: C++ only (static_cast, nullptr), so hide it from
+// C. Upstream lacks this guard; see PORTING.md "TODO upstream".
+#ifdef __cplusplus
 /// Returns the string representation of a LibreOfficeKitCallbackType enumeration element.
 static inline const char* lokCallbackTypeToString(int nType)
 {
@@ -1235,6 +1238,7 @@ static inline const char* lokCallbackTypeToString(int nType)
     assert(!"Unknown LibreOfficeKitCallbackType type.");
     return nullptr;
 }
+#endif // __cplusplus
 
 typedef enum
 {
