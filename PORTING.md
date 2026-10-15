@@ -149,6 +149,9 @@ Done:
 Deliberate deviations from GTK3 widget:
 - `edit-changed` emits the new value (upstream emitted the old one, contrary to its docs).
 - Constructors no longer set halign/valign=center; centering is done inside the widget.
+- View-only mode is enforced by LibreOffice too (`setViewReadOnly(viewId, !edit)`, when the
+  LibreOffice version has it): the GTK3 widget only stopped posting keys, so mouse edits such as
+  dragging cells in Calc still changed the document.
 - `lok_doc_view_post_command()` lets display-only commands (`isViewOnlyCommand()`: `.uno:ShowBoundaries`
   and its deprecated per-type predecessors) through in view-only mode; upstream dropped all commands.
 

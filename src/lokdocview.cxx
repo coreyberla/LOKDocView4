@@ -2463,6 +2463,21 @@ static void onFocusChanged(LOKDocView* pDocView)
 // ---------------------------------------------------------------------------
 
 /**
+ * Makes LOK itself treat the view as read-only outside edit mode. Not
+ * posting keys isn't enough: mouse edits (e.g. dragging cells in Calc) would
+ * still go through. Call with g_aLOKMutex held. setViewReadOnly() is missing
+ * from older LibreOffice versions' function table.
+ */
+static void applyViewReadOnly(LOKDocViewPrivate& priv)
+{
+    LibreOfficeKitDocument* pDocument = priv->m_pDocument;
+    if (LIBREOFFICEKIT_DOCUMENT_HAS(pDocument, setViewReadOnly))
+        pDocument->pClass->setViewReadOnly(pDocument, priv->m_nViewId, !priv->m_bEdit);
+    else
+        g_warning("This LibreOffice can't make views read-only; view-only mode only blocks keys");
+}
+
+/**
  * Main-thread setup once documentLoad() succeeded, or a view was created
  * (upstream postDocumentLoad()). nViewId: the view this widget is for, or
  * -1 after documentLoad() (the document's only view).
@@ -2485,6 +2500,7 @@ static void postDocumentLoad(LOKDocView* pDocView, int nViewId)
         pDocument->pClass->initializeForRendering(pDocument, priv->m_aRenderingArguments.c_str());
         // initializeForRendering() may change the view id in Impress, so query it afterwards.
         priv->m_nViewId = pDocument->pClass->getView(pDocument);
+        applyViewReadOnly(priv);
         pDocument->pClass->registerCallback(pDocument, lokCallback, priv->m_pHandle);
         priv->m_eTileMode = pDocument->pClass->getTileMode(pDocument);
         priv->m_eDocumentType = pDocument->pClass->getDocumentType(pDocument);
@@ -4083,17 +4099,15 @@ lok_doc_view_set_edit(LOKDocView* pDocView,
     if (bWasEdit == bool(bEdit))
         return;
 
-    if (bWasEdit)
+    g_info("lok_doc_view_set_edit: %s edit mode", bWasEdit ? "leaving" : "entering");
+    priv->m_bEdit = bEdit;
     {
-        g_info("lok_doc_view_set_edit: leaving edit mode");
         std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
         setDocumentView(priv->m_pDocument, priv->m_nViewId);
-        priv->m_pDocument->pClass->resetSelection(priv->m_pDocument);
+        if (bWasEdit)
+            priv->m_pDocument->pClass->resetSelection(priv->m_pDocument);
+        applyViewReadOnly(priv);
     }
-    else
-        g_info("lok_doc_view_set_edit: entering edit mode");
-
-    priv->m_bEdit = bEdit;
     // The cursor is only shown, and the IM only active, in edit mode.
     restartCursorBlink(pDocView);
     updateIMContext(pDocView);
