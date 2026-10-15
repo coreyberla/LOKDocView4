@@ -174,6 +174,22 @@ struct LOKDocViewPrivateImpl
     guint32 m_nLastPressTime = 0;
     guint m_nLastPressButton = 0;
 
+    /// Zoom anchor waiting for the next size_allocate (see setZoom()): the
+    /// widget point to keep fixed, and the document pixel (at the new zoom)
+    /// that must end up under it.
+    bool m_bZoomAnchorPending = false;
+    double m_fAnchorX = 0;
+    double m_fAnchorY = 0;
+    double m_fAnchorDocX = 0;
+    double m_fAnchorDocY = 0;
+    /// Coalesced setClientZoom(), see scheduleClientZoomUpdate().
+    guint m_nClientZoomIdleId = 0;
+    float m_fPinchStartZoom = 1.0f;
+    /// Last pointer position over the widget, for Ctrl+scroll zoom.
+    bool m_bPointerKnown = false;
+    double m_fPointerX = 0;
+    double m_fPointerY = 0;
+
     /// Latest hover position not yet sent to LOK (see onMotion()).
     bool m_bHoverPending = false;
     double m_fHoverX = 0;
@@ -1138,7 +1154,18 @@ static void lok_doc_view_measure(GtkWidget* pWidget, GtkOrientation eOrientation
 
 static void lok_doc_view_size_allocate(GtkWidget* pWidget, int /*nWidth*/, int /*nHeight*/, int /*nBaseline*/)
 {
-    configureAdjustments(LOK_DOC_VIEW(pWidget));
+    LOKDocView* pDocView = LOK_DOC_VIEW(pWidget);
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    configureAdjustments(pDocView);
+
+    // Apply a zoom anchor only now: before the adjustments know the new
+    // document size, the scroll value would be clamped to the old one.
+    if (priv->m_bZoomAnchorPending)
+    {
+        priv->m_bZoomAnchorPending = false;
+        gtk_adjustment_set_value(priv->m_pHAdjustment, priv->m_fAnchorDocX - priv->m_fAnchorX);
+        gtk_adjustment_set_value(priv->m_pVAdjustment, priv->m_fAnchorDocY - priv->m_fAnchorY);
+    }
 }
 
 static void onScaleFactorChanged(GObject* pObject, GParamSpec*, gpointer)
@@ -1232,6 +1259,9 @@ static void onMotion(GtkEventControllerMotion* pController, double fX, double fY
 {
     LOKDocView* pDocView = LOK_DOC_VIEW(pData);
     LOKDocViewPrivate& priv = getPrivate(pDocView);
+    priv->m_bPointerKnown = true;
+    priv->m_fPointerX = fX;
+    priv->m_fPointerY = fY;
     // While a button is down the drag gesture sends ordered moves itself.
     if (priv->m_nMouseButtons)
         return;
@@ -1257,6 +1287,52 @@ static void onMotion(GtkEventControllerMotion* pController, double fX, double fY
     priv->m_bHoverPending = true;
     if (!priv->m_nHoverRetryId) // otherwise a retry is already scheduled
         flushHover(pDocView);
+}
+
+static void onPointerLeave(GtkEventControllerMotion*, gpointer pData)
+{
+    getPrivate(LOK_DOC_VIEW(pData))->m_bPointerKnown = false;
+}
+
+static void setZoom(LOKDocView* pDocView, float fZoom, double fAnchorX, double fAnchorY);
+
+/// Ctrl+scroll zooms around the pointer; plain scrolling is left to the
+/// parent GtkScrolledWindow (its controller runs after ours).
+static gboolean onScroll(GtkEventControllerScroll* pController, double /*fDx*/, double fDy, gpointer pData)
+{
+    LOKDocView* pDocView = LOK_DOC_VIEW(pData);
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    GdkModifierType eState = gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(pController));
+    if (!(eState & GDK_CONTROL_MASK) || !priv->m_pDocument || fDy == 0)
+        return FALSE;
+
+    // A wheel notch (fDy = ±1) zooms by 10%. Touchpads report smooth deltas
+    // in surface pixels: scale those down to a comparable rate.
+    if (gtk_event_controller_scroll_get_unit(pController) == GDK_SCROLL_UNIT_SURFACE)
+        fDy /= 20;
+    float fZoom = priv->m_fZoom * static_cast<float>(std::pow(1.1, -fDy));
+
+    GtkWidget* pWidget = GTK_WIDGET(pDocView);
+    double fX = priv->m_bPointerKnown ? priv->m_fPointerX : gtk_widget_get_width(pWidget) / 2.0;
+    double fY = priv->m_bPointerKnown ? priv->m_fPointerY : gtk_widget_get_height(pWidget) / 2.0;
+    setZoom(pDocView, fZoom, fX, fY);
+    return TRUE;
+}
+
+/// Touchpad/touchscreen pinch: zoom around the gesture center.
+static void onPinchBegin(GtkGesture*, GdkEventSequence*, gpointer pData)
+{
+    LOKDocViewPrivate& priv = getPrivate(LOK_DOC_VIEW(pData));
+    priv->m_fPinchStartZoom = priv->m_fZoom;
+}
+
+static void onPinchScaleChanged(GtkGestureZoom* pGesture, double fScale, gpointer pData)
+{
+    LOKDocView* pDocView = LOK_DOC_VIEW(pData);
+    double fX, fY;
+    if (!gtk_gesture_get_bounding_box_center(GTK_GESTURE(pGesture), &fX, &fY))
+        return;
+    setZoom(pDocView, getPrivate(pDocView)->m_fPinchStartZoom * static_cast<float>(fScale), fX, fY);
 }
 
 // GtkGestureDrag gives us press (drag-begin), motion (drag-update) and release
@@ -1694,7 +1770,17 @@ static void lok_doc_view_init (LOKDocView* pDocView)
 
     GtkEventController* pMotion = gtk_event_controller_motion_new();
     g_signal_connect(pMotion, "motion", G_CALLBACK(onMotion), pDocView);
+    g_signal_connect(pMotion, "leave", G_CALLBACK(onPointerLeave), pDocView);
     gtk_widget_add_controller(pWidget, pMotion);
+
+    GtkEventController* pScroll = gtk_event_controller_scroll_new(GTK_EVENT_CONTROLLER_SCROLL_VERTICAL);
+    g_signal_connect(pScroll, "scroll", G_CALLBACK(onScroll), pDocView);
+    gtk_widget_add_controller(pWidget, pScroll);
+
+    GtkGesture* pPinch = gtk_gesture_zoom_new();
+    g_signal_connect(pPinch, "begin", G_CALLBACK(onPinchBegin), pDocView);
+    g_signal_connect(pPinch, "scale-changed", G_CALLBACK(onPinchScaleChanged), pDocView);
+    gtk_widget_add_controller(pWidget, GTK_EVENT_CONTROLLER(pPinch));
 
     GtkEventController* pKey = gtk_event_controller_key_new();
     priv->m_pKeyController = GTK_EVENT_CONTROLLER_KEY(pKey);
@@ -1880,6 +1966,7 @@ static void lok_doc_view_dispose (GObject* object)
         g_weak_ref_set(&priv->m_pHandle->m_aView, nullptr);
         g_clear_handle_id(&priv->m_nBlinkTimeoutId, g_source_remove);
         g_clear_handle_id(&priv->m_nHoverRetryId, g_source_remove);
+        g_clear_handle_id(&priv->m_nClientZoomIdleId, g_source_remove);
         // Before the document goes: the IM handlers post to it.
         if (priv->m_pIMContext)
         {
@@ -2904,8 +2991,34 @@ bool lok_approxEqual(double a, double b)
 }
 }
 
-LOK_DOC_VIEW_DLLPUBLIC void
-lok_doc_view_set_zoom (LOKDocView* pDocView, float fZoom)
+static gboolean applyClientZoom(gpointer pData)
+{
+    LOKDocView* pDocView = LOK_DOC_VIEW(pData);
+    getPrivate(pDocView)->m_nClientZoomIdleId = 0;
+    updateClientZoom(pDocView);
+    return G_SOURCE_REMOVE;
+}
+
+/// setClientZoom() once things settle: a pinch zooms dozens of times a second,
+/// and each call may wait for the LOK mutex behind a tile paint.
+static void scheduleClientZoomUpdate(LOKDocView* pDocView)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    if (!priv->m_nClientZoomIdleId)
+        priv->m_nClientZoomIdleId = g_idle_add_full(G_PRIORITY_LOW, applyClientZoom, pDocView, nullptr);
+}
+
+/**
+ * Sets the zoom so that the document point under (fAnchorX, fAnchorY)
+ * (widget coordinates) stays there.
+ *
+ * The scroll position can only be fixed up in size_allocate, once the
+ * adjustments know the new document size, so the target is recorded here.
+ * Several zoom steps may come before the next allocation (Ctrl+scroll,
+ * pinch); they continue from the pending target rather than the stale
+ * scroll position.
+ */
+static void setZoom(LOKDocView* pDocView, float fZoom, double fAnchorX, double fAnchorY)
 {
     LOKDocViewPrivate& priv = getPrivate(pDocView);
 
@@ -2918,7 +3031,27 @@ lok_doc_view_set_zoom (LOKDocView* pDocView, float fZoom)
     if (lok_approxEqual(fZoom, priv->m_fZoom))
         return;
 
-    // TODO: keep the point under the pointer / viewport center fixed while zooming.
+    // Document pixel under the anchor at the current zoom.
+    double fDocX, fDocY;
+    if (priv->m_bZoomAnchorPending)
+    {
+        fDocX = priv->m_fAnchorDocX + (fAnchorX - priv->m_fAnchorX);
+        fDocY = priv->m_fAnchorDocY + (fAnchorY - priv->m_fAnchorY);
+    }
+    else
+    {
+        double fOriginX, fOriginY;
+        getDocumentOrigin(pDocView, fOriginX, fOriginY);
+        fDocX = fAnchorX - fOriginX;
+        fDocY = fAnchorY - fOriginY;
+    }
+    double fRatio = fZoom / priv->m_fZoom;
+    priv->m_fAnchorX = fAnchorX;
+    priv->m_fAnchorY = fAnchorY;
+    priv->m_fAnchorDocX = fDocX * fRatio;
+    priv->m_fAnchorDocY = fDocY * fRatio;
+    priv->m_bZoomAnchorPending = true;
+
     startNewTileGeneration(pDocView, true); // before m_fZoom changes, see there
     priv->m_fZoom = fZoom;
     gtk_widget_queue_resize(GTK_WIDGET(pDocView));
@@ -2939,7 +3072,15 @@ lok_doc_view_set_zoom (LOKDocView* pDocView, float fZoom)
         g_object_notify_by_pspec(G_OBJECT(pDocView), properties[PROP_CAN_ZOOM_OUT]);
     }
 
-    updateClientZoom(pDocView);
+    scheduleClientZoomUpdate(pDocView);
+}
+
+LOK_DOC_VIEW_DLLPUBLIC void
+lok_doc_view_set_zoom (LOKDocView* pDocView, float fZoom)
+{
+    // Keep the center of the view fixed.
+    GtkWidget* pWidget = GTK_WIDGET(pDocView);
+    setZoom(pDocView, fZoom, gtk_widget_get_width(pWidget) / 2.0, gtk_widget_get_height(pWidget) / 2.0);
 }
 
 LOK_DOC_VIEW_DLLPUBLIC gfloat

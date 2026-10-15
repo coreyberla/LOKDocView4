@@ -90,6 +90,11 @@ Done:
   `delete-surrounding` → `removeTextContext`. Candidate window follows the cursor
   (`set_cursor_location` from snapshot). KEYUP only for keys whose press was posted, matched by
   hardware keycode.
+- Zoom keeps a document point fixed (`setZoom()`): the view center for `lok_doc_view_set_zoom()`,
+  the pointer for Ctrl+scroll, the gesture center for pinch (`GtkGestureZoom`). The scroll
+  position is applied in `size_allocate`, once the adjustments know the new size; zoom steps
+  before that continue from the pending target. `setClientZoom` is coalesced into a low-priority
+  idle (pinch would otherwise wait on the LOK mutex behind tile paints per step).
 - `demo/main.c` — plain-C viewer (zoom, edit toggle, progress, status).
 - Upstream's vcl/awt/boost deps replaced: local `MOUSE_*`/`KEY_*`/`AwtKey` constants, json-glib.
 
@@ -127,7 +132,7 @@ Rendering notes (LibreOffice behaviour, not ours):
 1. Overlays still missing: other views' cursors/selections, content controls, touch selection
    handles (upstream PNGs), dragging graphic handles via `setGraphicSelection()`.
 2. `setClientVisibleArea`; IM `retrieve-surrounding` (needs text around the cursor from LOK).
-3. Zoom anchoring, fractional scaling, part-aware invalidation; center-out tile order + prefetch.
+3. Fractional scaling, part-aware invalidation; center-out tile order + prefetch.
 4. Clipboard (`GdkClipboard`), comments, multi-view (`new_from_widget`), dialogs; port gtktiledviewer as test app.
 
 ## TODO upstream (LibreOffice)
