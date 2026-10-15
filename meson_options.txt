@@ -1,0 +1,4 @@
+option('lo_path', type: 'string', value: '',
+  description: 'Default LibreOffice program directory (containing libmergedlo.so); empty = <prefix>/<libdir>/libreoffice/program')
+option('demo', type: 'boolean', value: true,
+  description: 'Build the demo viewer application')
