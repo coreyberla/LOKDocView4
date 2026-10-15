@@ -12,6 +12,9 @@
 
 #include <LibreOfficeKit/LibreOfficeKitGtk.h>
 
+#include <stdio.h>
+#include <unistd.h>
+
 static char* g_pLOPath = NULL;
 
 typedef struct
@@ -224,7 +227,15 @@ int main(int argc, char** argv)
     g_debug("main loop finished, exiting");
     g_object_unref(pApp);
     g_free(g_pLOPath);
-    return nRet;
+
+    // LibreOffice has been destroy()ed by now (LOKDocView dispose), but some of
+    // its static destructors still reach into LOK (e.g. Writer asking for the
+    // LOK clipboard, which LibreOffice 26.8 dereferences after deinit) and
+    // crash. Like Collabora Online's kit process, skip them.
+    // TODO: return normally again once LibreOffice null-checks in
+    // LOKClipboardFactory::getClipboardForCurView() (see PORTING.md).
+    fflush(NULL);
+    _exit(nRet);
 }
 
 /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
