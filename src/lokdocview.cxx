@@ -3777,6 +3777,9 @@ lok_doc_view_set_part (LOKDocView* pDocView, int nPart)
     if (!priv->m_pDocument)
         return;
 
+    // Ask LOK rather than trust the count from load time: sheets/slides may
+    // have been inserted or deleted since.
+    priv->m_nParts = lok_doc_view_get_parts(pDocView);
     if (nPart < 0 || nPart >= priv->m_nParts)
     {
         g_warning("Invalid part request : %d", nPart);
