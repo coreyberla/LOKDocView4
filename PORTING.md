@@ -65,22 +65,57 @@ Done:
 - `include/LibreOfficeKit/LibreOfficeKitGtk.h` — same function API; structs now derive from `GtkWidget`.
 - `src/lokdocview.cxx` — all upstream properties + signals, `GInitable`, `GtkScrollable`
   (centers doc when smaller than viewport), async load (`g_task_run_in_thread`),
-  tiles via `paintTile` → `GdkMemoryTexture` → `gtk_snapshot_append_texture`,
   `GtkGestureDrag` mouse, `GtkEventControllerKey` keys, LOK callbacks marshalled
   via `g_idle_add` with a `GWeakRef`, simple signal-forwarding callbacks, whole public API.
-- `src/tilebuffer.*` — texture cache with rect invalidation.
+- Tile rendering off the main thread:
+  - `snapshot` never paints; it draws cached textures and queues missing/stale tiles
+    on a single-worker `GThreadPool` (`paintTileInThread` → `paintTile` → `GdkMemoryTexture`),
+    results come back via `g_idle_add` (`paintTileDone`).
+  - Invalidated tiles keep showing their old texture until the repaint lands (no flicker);
+    a per-tile serial discards results painted before the latest invalidation.
+  - Zoom/scale changes bump an atomic generation: queued requests for the old one are
+    skipped, old tiles are drawn scaled as a placeholder until the view is complete.
+- `src/tilebuffer.*` — texture cache with valid/pending/serial state per tile.
 - `demo/main.c` — plain-C viewer (zoom, edit toggle, progress, status).
 - Upstream's vcl/awt/boost deps replaced: local `MOUSE_*`/`KEY_*`/`AwtKey` constants, json-glib.
 
 Deliberate deviations from GTK3 widget:
 - `edit-changed` emits the new value (upstream emitted the old one, contrary to its docs).
 - Constructors no longer set halign/valign=center; centering is done inside the widget.
-- LOK calls are synchronous on the main thread under `g_aLOKMutex` (except load).
+- `lok_doc_view_post_command()` lets display-only commands (`isViewOnlyCommand()`: `.uno:ShowBoundaries`
+  and its deprecated per-type predecessors) through in view-only mode; upstream dropped all commands.
+
+Lifetime (GTK4 has no `destroy` that tears down every child regardless of refs):
+- LibreOffice must be `destroy()`ed before the process exits, or its static destructors crash/hang
+  at exit. Dispose does that, so the view must actually be disposed when its window closes.
+- Async work (LOK callbacks, tile paints) therefore holds a never-freed `ViewHandle` (weak ref +
+  tile generation), never a strong ref on the view.
+- The one exception is the load task (`documentLoad()` can't be interrupted); while it runs the
+  default `GApplication` is held, so the app can't exit mid-load.
+- Apps must not keep their own ref on the view past window close; the demo's signal handlers use
+  `g_signal_connect_object()` against the toplevel since the view can outlive it during a load.
+- Even after a clean `destroy()`, LibreOffice 26.8 crashes in its static destructors at exit:
+  a Writer static asks for the system clipboard → `LOKClipboardFactory::getClipboardForCurView()`
+  (`desktop/source/lib/lokclipboard.cxx`) dereferences `gClipboards.get()`, which is null after
+  `DeleteOnDeinit` teardown (`releaseClipboardForView()` checks it, this doesn't). Upstream bug.
+  Workaround (as Collabora Online's kit does): apps `fflush(NULL); _exit(status);` after their main
+  loop instead of returning from `main`. The demo does this.
+
+Rendering notes (LibreOffice behaviour, not ours):
+- Writer's `initializeForRendering` (`sw/source/uibase/uno/unotxdoc.cxx`) force-disables field
+  shadings in tiled mode, so form-field grey boxes never show — same in GTK3 widget / Collabora Online.
+- Other view options (table/text boundaries, …) come from the LibreOffice user profile in use.
+  The demo uses its own profile (`$XDG_CONFIG_HOME/lokdocview4`) and sets `.uno:ShowBoundaries` explicitly.
+- Tiles paint on a worker; all other LOK calls (keys, mouse, commands) run on the main
+  thread under `g_aLOKMutex`, so they can wait for at most one in-flight tile paint.
 
 ## Next steps
-1. Build & smoke test in toolbox; fix compile errors.
-2. Async tile rendering on a single-worker `GThreadPool` (upstream `LOK_PAINT_TILE`), placeholder while pending.
-3. Overlays: visible cursor (+blink), text selection, handles, graphic selection, cell cursor, other views.
-4. IM context (`GtkIMMulticontext`), mouse pointer shape (`LOK_CALLBACK_MOUSE_POINTER`), `setClientVisibleArea`.
-5. Zoom anchoring, fractional scaling, part-aware invalidation.
-6. Clipboard (`GdkClipboard`), comments, multi-view (`new_from_widget`), dialogs; port gtktiledviewer as test app.
+1. Overlays: visible cursor (+blink), text selection, handles, graphic selection, cell cursor, other views.
+2. IM context (`GtkIMMulticontext`), mouse pointer shape (`LOK_CALLBACK_MOUSE_POINTER`), `setClientVisibleArea`.
+3. Zoom anchoring, fractional scaling, part-aware invalidation; center-out tile order + prefetch.
+4. Clipboard (`GdkClipboard`), comments, multi-view (`new_from_widget`), dialogs; port gtktiledviewer as test app.
+
+## TODO upstream (LibreOffice)
+- Exit-time crash: null-check `gClipboards.get()` in `LOKClipboardFactory::getClipboardForCurView()`
+  and in `releaseClipboardForView()`'s clear-all branch (`desktop/source/lib/lokclipboard.cxx`).
+  Submit patch + bug report; once released, drop the demo's `_exit()` workaround and return from `main`.
