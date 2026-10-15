@@ -78,7 +78,12 @@ Done:
 - `src/tilebuffer.*` — texture cache with valid/pending/serial state per tile.
 - Overlays (`appendOverlays()`): own text cursor (blinks per `gtk-cursor-blink*` settings, only
   while focused and in edit mode), text selection, graphic selection frame + 8 handles, Calc cell
-  cursor. `cursor-changed` reports twips like the GTK3 widget (its docs say pixels).- `demo/main.c` — plain-C viewer (zoom, edit toggle, progress, status).
+  cursor. `cursor-changed` reports twips like the GTK3 widget (its docs say pixels).
+- Mouse pointer shape: hover posts button-less mouse moves (`onMotion()`/`flushHover()`, try-lock so
+  the UI never waits behind a tile paint; latest position retried), LOK answers with
+  `LOK_CALLBACK_MOUSE_POINTER` CSS names → `gtk_widget_set_cursor_from_name()`. Also in view-only
+  mode, unlike the GTK3 widget.
+- `demo/main.c` — plain-C viewer (zoom, edit toggle, progress, status).
 - Upstream's vcl/awt/boost deps replaced: local `MOUSE_*`/`KEY_*`/`AwtKey` constants, json-glib.
 
 Deliberate deviations from GTK3 widget:
@@ -114,7 +119,7 @@ Rendering notes (LibreOffice behaviour, not ours):
 ## Next steps
 1. Overlays still missing: other views' cursors/selections, content controls, touch selection
    handles (upstream PNGs), dragging graphic handles via `setGraphicSelection()`.
-2. IM context (`GtkIMMulticontext`), mouse pointer shape (`LOK_CALLBACK_MOUSE_POINTER`), `setClientVisibleArea`.
+2. IM context (`GtkIMMulticontext`), `setClientVisibleArea`.
 3. Zoom anchoring, fractional scaling, part-aware invalidation; center-out tile order + prefetch.
 4. Clipboard (`GdkClipboard`), comments, multi-view (`new_from_widget`), dialogs; port gtktiledviewer as test app.
 

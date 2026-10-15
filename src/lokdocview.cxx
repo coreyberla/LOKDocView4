@@ -173,6 +173,17 @@ struct LOKDocViewPrivateImpl
     guint32 m_nLastPressTime = 0;
     guint m_nLastPressButton = 0;
 
+    /// Latest hover position not yet sent to LOK (see onMotion()).
+    bool m_bHoverPending = false;
+    double m_fHoverX = 0;
+    double m_fHoverY = 0;
+    int m_nHoverModifier = 0;
+    guint m_nHoverRetryId = 0;
+    /// Last LOK_CALLBACK_MOUSE_POINTER shape, applied only while the pointer
+    /// is over the document.
+    std::string m_aPointerName = "default";
+    bool m_bPointerInDocument = false;
+
     // Overlay state, in document twips (LOK draws none of this into tiles).
     /// Own text cursor (LOK_CALLBACK_INVALIDATE_VISIBLE_CURSOR); width may be 0.
     GdkRectangle m_aVisibleCursor = {};
@@ -730,6 +741,14 @@ static void handleCallback(LOKDocView* pDocView, CallbackEvent* pEvent)
         priv->m_aCellCursor = payloadToRectangle(priv, pPayload);
         gtk_widget_queue_draw(GTK_WIDGET(pDocView));
         break;
+    case LOK_CALLBACK_MOUSE_POINTER:
+        // CSS cursor names ("text", "pointer", "move", ...), as GTK4 takes them;
+        // unknown names fall back to the default pointer. Unlike the GTK3
+        // widget, also in view-only mode: selecting and links work there too.
+        priv->m_aPointerName = rPayload;
+        if (priv->m_bPointerInDocument)
+            gtk_widget_set_cursor_from_name(GTK_WIDGET(pDocView), pPayload);
+        break;
     case LOK_CALLBACK_CONTENT_CONTROL:
         g_signal_emit(pDocView, doc_view_signals[CONTENT_CONTROL], 0, pPayload);
         break;
@@ -1157,6 +1176,69 @@ static void postMouseEvent(LOKDocView* pDocView, int nType, double fX, double fY
     priv->m_pDocument->pClass->postMouseEvent(priv->m_pDocument, nType, nTwipX, nTwipY, nCount, nButtons, nModifier);
 }
 
+static gboolean flushHover(gpointer pData);
+
+/**
+ * Sends the pending hover position as a button-less mouse move, which is what
+ * makes LOK report the pointer shape (LOK_CALLBACK_MOUSE_POINTER) and hover
+ * effects. Only try-locks: if the paint worker holds the LOK mutex, keep the
+ * latest position and retry shortly instead of blocking the UI behind a tile
+ * paint. Intermediate positions don't matter for hover.
+ */
+static gboolean flushHover(gpointer pData)
+{
+    LOKDocView* pDocView = LOK_DOC_VIEW(pData);
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    priv->m_nHoverRetryId = 0;
+    if (!priv->m_bHoverPending || !priv->m_pDocument)
+        return G_SOURCE_REMOVE;
+
+    int nTwipX, nTwipY;
+    widgetToTwip(pDocView, priv->m_fHoverX, priv->m_fHoverY, nTwipX, nTwipY);
+    std::unique_lock<std::mutex> aGuard(g_aLOKMutex, std::try_to_lock);
+    if (!aGuard.owns_lock())
+    {
+        priv->m_nHoverRetryId = g_timeout_add(16, flushHover, pDocView);
+        return G_SOURCE_REMOVE;
+    }
+    priv->m_bHoverPending = false;
+    setDocumentView(priv->m_pDocument, priv->m_nViewId);
+    priv->m_pDocument->pClass->postMouseEvent(priv->m_pDocument, LOK_MOUSEEVENT_MOUSEMOVE, nTwipX, nTwipY,
+                                              1, 0, priv->m_nHoverModifier);
+    return G_SOURCE_REMOVE;
+}
+
+static void onMotion(GtkEventControllerMotion* pController, double fX, double fY, gpointer pData)
+{
+    LOKDocView* pDocView = LOK_DOC_VIEW(pData);
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    // While a button is down the drag gesture sends ordered moves itself.
+    if (priv->m_nMouseButtons)
+        return;
+
+    // Outside the document (e.g. beside a centered page) nothing belongs to
+    // LOK: show the default pointer and don't ask LOK about it. Restore LOK's
+    // last shape on the way back in, as it only reports changes.
+    double fOriginX, fOriginY;
+    getDocumentOrigin(pDocView, fOriginX, fOriginY);
+    bool bInDocument = fX >= fOriginX && fX < fOriginX + getDocumentWidthPixels(priv)
+                       && fY >= fOriginY && fY < fOriginY + getDocumentHeightPixels(priv);
+    if (bInDocument != priv->m_bPointerInDocument)
+    {
+        priv->m_bPointerInDocument = bInDocument;
+        gtk_widget_set_cursor_from_name(GTK_WIDGET(pDocView), bInDocument ? priv->m_aPointerName.c_str() : nullptr);
+    }
+    if (!bInDocument)
+        return;
+
+    priv->m_fHoverX = fX;
+    priv->m_fHoverY = fY;
+    priv->m_nHoverModifier = toLOKModifier(gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(pController)));
+    priv->m_bHoverPending = true;
+    if (!priv->m_nHoverRetryId) // otherwise a retry is already scheduled
+        flushHover(pDocView);
+}
+
 // GtkGestureDrag gives us press (drag-begin), motion (drag-update) and release
 // (drag-end) for the same sequence, even without movement. Click counting is
 // done by hand, like upstream.
@@ -1436,6 +1518,10 @@ static void lok_doc_view_init (LOKDocView* pDocView)
     g_signal_connect(pDrag, "drag-end", G_CALLBACK(onDragEnd), pDocView);
     gtk_widget_add_controller(pWidget, GTK_EVENT_CONTROLLER(pDrag));
 
+    GtkEventController* pMotion = gtk_event_controller_motion_new();
+    g_signal_connect(pMotion, "motion", G_CALLBACK(onMotion), pDocView);
+    gtk_widget_add_controller(pWidget, pMotion);
+
     GtkEventController* pKey = gtk_event_controller_key_new();
     g_signal_connect(pKey, "key-pressed", G_CALLBACK(onKeyPressed), pDocView);
     g_signal_connect(pKey, "key-released", G_CALLBACK(onKeyReleased), pDocView);
@@ -1612,6 +1698,7 @@ static void lok_doc_view_dispose (GObject* object)
         priv->m_bDisposed = true;
         g_weak_ref_set(&priv->m_pHandle->m_aView, nullptr);
         g_clear_handle_id(&priv->m_nBlinkTimeoutId, g_source_remove);
+        g_clear_handle_id(&priv->m_nHoverRetryId, g_source_remove);
         // GtkWidget's dispose frees the controllers.
         priv->m_pFocusController = nullptr;
 
