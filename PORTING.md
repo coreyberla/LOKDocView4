@@ -90,6 +90,22 @@ Done:
   `delete-surrounding` → `removeTextContext`. Candidate window follows the cursor
   (`set_cursor_location` from snapshot). KEYUP only for keys whose press was posted, matched by
   hardware keycode.
+- System clipboard (`GdkClipboard`); the GTK3 widget only had LOK's internal per-view clipboard.
+  - Copy/cut: shortcuts and `post_command` run `.uno:Copy`/`.uno:Cut` with bNotifyWhenFinished;
+    on its `LOK_CALLBACK_UNO_COMMAND_RESULT` the LOK clipboard is fetched eagerly via
+    `getClipboard()` as LibreOffice's native embed-source XML, HTML, RTF (+`application/rtf`), PNG
+    and text, and published as a `GdkContentProvider` union. Results of commands we only posted
+    for ourselves aren't emitted as `command-result`. Copy also works in view-only mode.
+  - `LOK_CALLBACK_CLIPBOARD_CHANGED` (empty payload, to all views) is handled too, by the view that
+    last had input (`g_pLastActiveHandle`; each view has its own LOK clipboard), but observed not
+    to fire for copies in practice (LibreOffice 26.8, Calc): the listener sits on the LOK clipboard
+    of whatever view was current when the controller was created, presumably not the one copies
+    write to. Hence the command-result route.
+  - Paste (Ctrl+V, Shift+Insert, Paste key, `.uno:Paste`/`.uno:PasteUnformattedText` via
+    `post_command`): our own content → `.uno:Paste` from LOK's clipboard; otherwise the richest
+    available format, read async (bytes, or GDK conversions to texture → PNG / text), → `paste()`.
+  - `paste()` itself triggers `CLIPBOARD_CHANGED`; it's recognised by matching the pasted bytes
+    and not echoed back to the system clipboard.
 - Zoom keeps a document point fixed (`setZoom()`): the view center for `lok_doc_view_set_zoom()`,
   the pointer for Ctrl+scroll, the gesture center for pinch (`GtkGestureZoom`). The scroll
   position is applied in `size_allocate`, once the adjustments know the new size; zoom steps
@@ -133,7 +149,9 @@ Rendering notes (LibreOffice behaviour, not ours):
    handles (upstream PNGs), dragging graphic handles via `setGraphicSelection()`.
 2. `setClientVisibleArea`; IM `retrieve-surrounding` (needs text around the cursor from LOK).
 3. Fractional scaling, part-aware invalidation; center-out tile order + prefetch.
-4. Clipboard (`GdkClipboard`), comments, multi-view (`new_from_widget`), dialogs; port gtktiledviewer as test app.
+4. Comments, multi-view (`new_from_widget`), dialogs; port gtktiledviewer as test app.
+5. Clipboard leftovers: primary selection (middle-click paste), lazy export (only convert the
+   formats another app actually requests).
 
 ## TODO upstream (LibreOffice)
 - Exit-time crash: null-check `gClipboards.get()` in `LOKClipboardFactory::getClipboardForCurView()`

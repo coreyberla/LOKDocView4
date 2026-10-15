@@ -39,7 +39,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -215,6 +217,19 @@ struct LOKDocViewPrivateImpl
     /// keyval/state of the press: only those get a KEYUP, and with the same
     /// keyval even if Shift was released first.
     std::map<guint, std::pair<guint, GdkModifierType>> m_aKeysDown;
+
+    /// What we last put on the system clipboard (owned ref), to recognise
+    /// our own content when pasting.
+    GdkContentProvider* m_pExportedContent = nullptr;
+    /// What we last paste()d into LOK: LOK reports that as a clipboard change
+    /// too, which must not be echoed back to the system clipboard.
+    std::string m_aLastPasteMimeType;
+    GBytes* m_pLastPasteData = nullptr;
+    /// Cancels pending system clipboard reads on dispose.
+    GCancellable* m_pClipboardCancellable = nullptr;
+    /// Commands we asked a result for only for our own use; their
+    /// LOK_CALLBACK_UNO_COMMAND_RESULT isn't emitted as command-result.
+    std::multiset<std::string> m_aInternalCommandResults;
 
     // Overlay state, in document twips (LOK draws none of this into tiles).
     /// Own text cursor (LOK_CALLBACK_INVALIDATE_VISIBLE_CURSOR); width may be 0.
@@ -490,6 +505,341 @@ static void setIsLoading(LOKDocView* pDocView, bool bIsLoading)
 }
 
 // ---------------------------------------------------------------------------
+// System clipboard
+// ---------------------------------------------------------------------------
+
+namespace
+{
+/// LibreOffice's native clipboard format, as desktop LibreOffice offers it.
+constexpr char aEmbedSourceMimeType[] = "application/x-openoffice-embed-source-xml;windows_formatname=\"Star Embed Source (XML)\"";
+
+/// Formats published to the system clipboard after a copy in LOK.
+const char* aExportMimeTypes[] = { aEmbedSourceMimeType, "text/html", "text/rtf", "image/png",
+                                   "text/plain;charset=utf-8", nullptr };
+
+/// Formats taken from the system clipboard on paste, best first. Images in
+/// other formats and plain text are handled through GDK's conversions.
+const char* const aPasteMimeTypes[] = { aEmbedSourceMimeType, "text/html", "text/rtf", "application/rtf", "image/png" };
+
+/**
+ * View that last had input. LOK notifies every view about a clipboard
+ * change, but each view has its own LOK clipboard: only the view the copy
+ * happened in may publish it, others would publish stale content.
+ */
+ViewHandle* g_pLastActiveHandle = nullptr;
+
+/// A pending system clipboard read for a paste.
+struct ClipboardRead
+{
+    ViewHandle* m_pHandle;
+    /// Mime type to hand to LOK.
+    std::string m_aMimeType;
+    GCancellable* m_pCancellable; // ref
+    GOutputStream* m_pBuffer = nullptr;
+
+    ~ClipboardRead()
+    {
+        g_clear_object(&m_pBuffer);
+        g_clear_object(&m_pCancellable);
+    }
+};
+}
+
+static void setActiveView(LOKDocView* pDocView)
+{
+    g_pLastActiveHandle = getPrivate(pDocView)->m_pHandle;
+}
+
+/// LOK_CALLBACK_CLIPBOARD_CHANGED: publish this view's LOK clipboard to the
+/// system clipboard. The data is fetched right away, so it stays pasteable
+/// elsewhere after the document is closed.
+static void exportClipboard(LOKDocView* pDocView)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    if (!priv->m_pDocument || (g_pLastActiveHandle && g_pLastActiveHandle != priv->m_pHandle))
+        return;
+
+    size_t nCount = 0;
+    char** ppMimeTypes = nullptr;
+    size_t* pSizes = nullptr;
+    char** ppStreams = nullptr;
+    {
+        std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
+        setDocumentView(priv->m_pDocument, priv->m_nViewId);
+        if (!priv->m_pDocument->pClass->getClipboard(priv->m_pDocument, aExportMimeTypes, &nCount, &ppMimeTypes,
+                                                     &pSizes, &ppStreams))
+            return;
+    }
+
+    std::vector<GdkContentProvider*> aProviders;
+    bool bEcho = false;
+    for (size_t i = 0; i < nCount; ++i)
+    {
+        if (pSizes[i] && ppStreams[i])
+        {
+            std::string_view aMimeType(ppMimeTypes[i]);
+            g_autoptr(GBytes) pBytes = g_bytes_new(ppStreams[i], pSizes[i]);
+            if (priv->m_pLastPasteData && aMimeType == priv->m_aLastPasteMimeType
+                && g_bytes_equal(pBytes, priv->m_pLastPasteData))
+                bEcho = true;
+
+            if (aMimeType == "text/plain;charset=utf-8")
+            {
+                // As a string, so GDK offers all the usual text targets.
+                std::string aText(ppStreams[i], pSizes[i]);
+                aProviders.push_back(gdk_content_provider_new_typed(G_TYPE_STRING, aText.c_str()));
+            }
+            else
+            {
+                aProviders.push_back(gdk_content_provider_new_for_bytes(ppMimeTypes[i], pBytes));
+                if (aMimeType == "text/rtf")
+                    aProviders.push_back(gdk_content_provider_new_for_bytes("application/rtf", pBytes));
+            }
+        }
+        free(ppMimeTypes[i]);
+        free(ppStreams[i]);
+    }
+    free(ppMimeTypes);
+    free(pSizes);
+    free(ppStreams);
+
+    // Our own paste() changed LOK's clipboard: nothing new to publish.
+    if (bEcho || aProviders.empty())
+    {
+        for (GdkContentProvider* pProvider : aProviders)
+            g_object_unref(pProvider);
+        return;
+    }
+
+    g_clear_object(&priv->m_pExportedContent);
+    priv->m_pExportedContent = gdk_content_provider_new_union(aProviders.data(), aProviders.size());
+    gdk_clipboard_set_content(gtk_widget_get_clipboard(GTK_WIDGET(pDocView)), priv->m_pExportedContent);
+    g_clear_pointer(&priv->m_pLastPasteData, g_bytes_unref);
+}
+
+/// Pastes data via LOK (setClipboard + .uno:Paste), remembering it so the
+/// resulting clipboard change isn't echoed back.
+static bool pasteData(LOKDocView* pDocView, const char* pMimeType, const char* pData, gsize nSize)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    if (!priv->m_pDocument || !priv->m_bEdit || !pData)
+        return false;
+
+    priv->m_aLastPasteMimeType = pMimeType;
+    g_clear_pointer(&priv->m_pLastPasteData, g_bytes_unref);
+    priv->m_pLastPasteData = g_bytes_new(pData, nSize);
+
+    g_info("lok::Document::paste('%s', %" G_GSIZE_FORMAT " bytes)", pMimeType, nSize);
+    std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
+    setDocumentView(priv->m_pDocument, priv->m_nViewId);
+    return priv->m_pDocument->pClass->paste(priv->m_pDocument, pMimeType, pData, nSize);
+}
+
+/// Runs pasteData() for a finished read, if the view is still there.
+static void finishClipboardRead(ClipboardRead* pRead, const char* pData, gsize nSize)
+{
+    if (gpointer pView = g_weak_ref_get(&pRead->m_pHandle->m_aView))
+    {
+        pasteData(LOK_DOC_VIEW(pView), pRead->m_aMimeType.c_str(), pData, nSize);
+        g_object_unref(pView);
+    }
+}
+
+static void warnClipboardError(GError* pError)
+{
+    if (!g_error_matches(pError, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        g_warning("Reading the clipboard failed: %s", pError->message);
+    g_error_free(pError);
+}
+
+static void onPasteSpliced(GObject* pSource, GAsyncResult* pResult, gpointer pData)
+{
+    std::unique_ptr<ClipboardRead> pRead(static_cast<ClipboardRead*>(pData));
+    GError* pError = nullptr;
+    if (g_output_stream_splice_finish(G_OUTPUT_STREAM(pSource), pResult, &pError) < 0)
+        return warnClipboardError(pError);
+
+    g_autoptr(GBytes) pBytes = g_memory_output_stream_steal_as_bytes(G_MEMORY_OUTPUT_STREAM(pRead->m_pBuffer));
+    gsize nSize = 0;
+    auto* pBuffer = static_cast<const char*>(g_bytes_get_data(pBytes, &nSize));
+    finishClipboardRead(pRead.get(), pBuffer ? pBuffer : "", nSize);
+}
+
+static void onPasteStreamReady(GObject* pSource, GAsyncResult* pResult, gpointer pData)
+{
+    std::unique_ptr<ClipboardRead> pRead(static_cast<ClipboardRead*>(pData));
+    GError* pError = nullptr;
+    g_autoptr(GInputStream) pStream = gdk_clipboard_read_finish(GDK_CLIPBOARD(pSource), pResult, nullptr, &pError);
+    if (!pStream)
+        return warnClipboardError(pError);
+
+    pRead->m_pBuffer = g_memory_output_stream_new_resizable();
+    GOutputStream* pBuffer = pRead->m_pBuffer;
+    GCancellable* pCancellable = pRead->m_pCancellable;
+    g_output_stream_splice_async(pBuffer, pStream,
+                                 static_cast<GOutputStreamSpliceFlags>(G_OUTPUT_STREAM_SPLICE_CLOSE_SOURCE
+                                                                       | G_OUTPUT_STREAM_SPLICE_CLOSE_TARGET),
+                                 G_PRIORITY_DEFAULT, pCancellable, onPasteSpliced, pRead.release());
+}
+
+static void onPasteText(GObject* pSource, GAsyncResult* pResult, gpointer pData)
+{
+    std::unique_ptr<ClipboardRead> pRead(static_cast<ClipboardRead*>(pData));
+    GError* pError = nullptr;
+    g_autofree char* pText = gdk_clipboard_read_text_finish(GDK_CLIPBOARD(pSource), pResult, &pError);
+    if (!pText)
+        return pError ? warnClipboardError(pError) : void();
+    finishClipboardRead(pRead.get(), pText, strlen(pText));
+}
+
+static void onPasteTexture(GObject* pSource, GAsyncResult* pResult, gpointer pData)
+{
+    std::unique_ptr<ClipboardRead> pRead(static_cast<ClipboardRead*>(pData));
+    GError* pError = nullptr;
+    g_autoptr(GdkTexture) pTexture = gdk_clipboard_read_texture_finish(GDK_CLIPBOARD(pSource), pResult, &pError);
+    if (!pTexture)
+        return pError ? warnClipboardError(pError) : void();
+    g_autoptr(GBytes) pPng = gdk_texture_save_to_png_bytes(pTexture);
+    gsize nSize = 0;
+    auto* pBuffer = static_cast<const char*>(g_bytes_get_data(pPng, &nSize));
+    finishClipboardRead(pRead.get(), pBuffer, nSize);
+}
+
+/**
+ * Pastes the system clipboard: our own copy straight from LOK's clipboard
+ * (all formats, full fidelity), otherwise the richest format available,
+ * read asynchronously. bTextOnly: plain text only (unformatted paste).
+ */
+static void pasteFromClipboard(LOKDocView* pDocView, bool bTextOnly)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    if (!priv->m_pDocument || !priv->m_bEdit)
+        return;
+
+    GdkClipboard* pClipboard = gtk_widget_get_clipboard(GTK_WIDGET(pDocView));
+    if (!bTextOnly && priv->m_pExportedContent && gdk_clipboard_get_content(pClipboard) == priv->m_pExportedContent)
+    {
+        std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
+        setDocumentView(priv->m_pDocument, priv->m_nViewId);
+        priv->m_pDocument->pClass->postUnoCommand(priv->m_pDocument, ".uno:Paste", nullptr, false);
+        return;
+    }
+
+    auto* pRead = new ClipboardRead{ priv->m_pHandle, "", G_CANCELLABLE(g_object_ref(priv->m_pClipboardCancellable)) };
+    GdkContentFormats* pFormats = gdk_clipboard_get_formats(pClipboard);
+    if (!bTextOnly)
+    {
+        for (const char* pMimeType : aPasteMimeTypes)
+        {
+            if (!gdk_content_formats_contain_mime_type(pFormats, pMimeType))
+                continue;
+            // LibreOffice knows RTF as text/rtf.
+            pRead->m_aMimeType = g_str_equal(pMimeType, "application/rtf") ? "text/rtf" : pMimeType;
+            const char* aMimeTypes[] = { pMimeType, nullptr };
+            gdk_clipboard_read_async(pClipboard, aMimeTypes, G_PRIORITY_DEFAULT, pRead->m_pCancellable,
+                                     onPasteStreamReady, pRead);
+            return;
+        }
+    }
+
+    // Whatever GDK can convert: other image formats to a texture, text to UTF-8.
+    g_autoptr(GdkContentFormats) pTypes = gdk_content_formats_union_deserialize_gtypes(gdk_content_formats_ref(pFormats));
+    if (!bTextOnly && gdk_content_formats_contain_gtype(pTypes, GDK_TYPE_TEXTURE))
+    {
+        pRead->m_aMimeType = "image/png";
+        gdk_clipboard_read_texture_async(pClipboard, pRead->m_pCancellable, onPasteTexture, pRead);
+    }
+    else if (gdk_content_formats_contain_gtype(pTypes, G_TYPE_STRING))
+    {
+        pRead->m_aMimeType = "text/plain;charset=utf-8";
+        gdk_clipboard_read_text_async(pClipboard, pRead->m_pCancellable, onPasteText, pRead);
+    }
+    else
+        delete pRead; // nothing we can paste
+}
+
+/**
+ * Posts .uno:Copy / .uno:Cut with a result notification: the system
+ * clipboard is filled when LOK reports the command done (see
+ * handleCallback()). LOK_CALLBACK_CLIPBOARD_CHANGED alone isn't reliable for
+ * this: the LOK clipboard the listener sits on isn't necessarily the one a
+ * copy writes to. bInternal: the caller didn't ask for command-result.
+ */
+static void postClipboardCommand(LOKDocView* pDocView, const char* pCommand, bool bInternal)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    if (!priv->m_pDocument)
+        return;
+    if (bInternal)
+        priv->m_aInternalCommandResults.insert(pCommand);
+    std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
+    setDocumentView(priv->m_pDocument, priv->m_nViewId);
+    priv->m_pDocument->pClass->postUnoCommand(priv->m_pDocument, pCommand, nullptr, true);
+}
+
+/// Clipboard shortcuts handled here rather than by LOK; true if consumed.
+static bool handleClipboardShortcut(LOKDocView* pDocView, guint nKeyval, GdkModifierType eState)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    if (!priv->m_pDocument)
+        return false;
+
+    GdkModifierType eMods = static_cast<GdkModifierType>(eState & (GDK_SHIFT_MASK | GDK_CONTROL_MASK | GDK_ALT_MASK));
+    bool bPaste = ((nKeyval == GDK_KEY_v || nKeyval == GDK_KEY_V) && eMods == GDK_CONTROL_MASK)
+                  || (nKeyval == GDK_KEY_Insert && eMods == GDK_SHIFT_MASK) || nKeyval == GDK_KEY_Paste;
+    bool bCopy = ((nKeyval == GDK_KEY_c || nKeyval == GDK_KEY_C) && eMods == GDK_CONTROL_MASK)
+                 || (nKeyval == GDK_KEY_Insert && eMods == GDK_CONTROL_MASK) || nKeyval == GDK_KEY_Copy;
+    bool bCut = ((nKeyval == GDK_KEY_x || nKeyval == GDK_KEY_X) && eMods == GDK_CONTROL_MASK)
+                || (nKeyval == GDK_KEY_Delete && eMods == GDK_SHIFT_MASK) || nKeyval == GDK_KEY_Cut;
+
+    if (bPaste && priv->m_bEdit)
+    {
+        pasteFromClipboard(pDocView, false);
+        return true;
+    }
+    // Copy also in view-only mode, where keys aren't posted to LOK.
+    if (bCopy)
+    {
+        postClipboardCommand(pDocView, ".uno:Copy", true);
+        return true;
+    }
+    if (bCut && priv->m_bEdit)
+    {
+        postClipboardCommand(pDocView, ".uno:Cut", true);
+        return true;
+    }
+    return false;
+}
+
+/// LOK_CALLBACK_UNO_COMMAND_RESULT: {"commandName": ..., "success": ...}.
+static void handleCommandResult(LOKDocView* pDocView, const std::string& rPayload)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    std::string aCommand;
+    bool bFailed = false;
+
+    g_autoptr(JsonParser) pParser = json_parser_new();
+    if (json_parser_load_from_data(pParser, rPayload.c_str(), -1, nullptr)
+        && JSON_NODE_HOLDS_OBJECT(json_parser_get_root(pParser)))
+    {
+        JsonObject* pObject = json_node_get_object(json_parser_get_root(pParser));
+        aCommand = json_object_get_string_member_with_default(pObject, "commandName", "");
+        // "success" is missing when LOK doesn't know; only skip on a definite failure.
+        bFailed = json_object_has_member(pObject, "success")
+                  && !json_object_get_boolean_member(pObject, "success");
+    }
+
+    if ((aCommand == ".uno:Copy" || aCommand == ".uno:Cut") && !bFailed)
+        exportClipboard(pDocView);
+
+    auto it = priv->m_aInternalCommandResults.find(aCommand);
+    if (it != priv->m_aInternalCommandResults.end())
+        priv->m_aInternalCommandResults.erase(it);
+    else
+        g_signal_emit(pDocView, doc_view_signals[COMMAND_RESULT], 0, rPayload.c_str());
+}
+
+// ---------------------------------------------------------------------------
 // LOK callbacks
 // ---------------------------------------------------------------------------
 
@@ -737,7 +1087,7 @@ static void handleCallback(LOKDocView* pDocView, CallbackEvent* pEvent)
         g_signal_emit(pDocView, doc_view_signals[PART_CHANGED], 0, priv->m_nPartId);
         break;
     case LOK_CALLBACK_UNO_COMMAND_RESULT:
-        g_signal_emit(pDocView, doc_view_signals[COMMAND_RESULT], 0, pPayload);
+        handleCommandResult(pDocView, rPayload);
         break;
     case LOK_CALLBACK_CELL_ADDRESS:
         g_signal_emit(pDocView, doc_view_signals[ADDRESS_CHANGED], 0, pPayload);
@@ -772,6 +1122,9 @@ static void handleCallback(LOKDocView* pDocView, CallbackEvent* pEvent)
     case LOK_CALLBACK_CELL_CURSOR:
         priv->m_aCellCursor = payloadToRectangle(priv, pPayload);
         gtk_widget_queue_draw(GTK_WIDGET(pDocView));
+        break;
+    case LOK_CALLBACK_CLIPBOARD_CHANGED:
+        exportClipboard(pDocView);
         break;
     case LOK_CALLBACK_MOUSE_POINTER:
         // CSS cursor names ("text", "pointer", "move", ...), as GTK4 takes them;
@@ -1347,6 +1700,7 @@ static void onDragBegin(GtkGestureDrag* pGesture, double fX, double fY, gpointer
     guint32 nTime = gtk_event_controller_get_current_event_time(pController);
 
     gtk_widget_grab_focus(GTK_WIDGET(pDocView));
+    setActiveView(pDocView);
 
     int nDoubleClickTime = 400;
     g_object_get(gtk_widget_get_settings(GTK_WIDGET(pDocView)), "gtk-double-click-time", &nDoubleClickTime, nullptr);
@@ -1488,6 +1842,9 @@ static bool postKey(LOKDocView* pDocView, int nType, guint nKeyval, GdkModifierT
 static gboolean onKeyPressed(GtkEventControllerKey*, guint nKeyval, guint nKeycode, GdkModifierType eState, gpointer pData)
 {
     LOKDocView* pDocView = LOK_DOC_VIEW(pData);
+    setActiveView(pDocView);
+    if (handleClipboardShortcut(pDocView, nKeyval, eState))
+        return TRUE;
     if (!postKey(pDocView, LOK_KEYEVENT_KEYINPUT, nKeyval, eState))
         return FALSE;
     getPrivate(pDocView)->m_aKeysDown[nKeycode] = { nKeyval, eState };
@@ -1750,6 +2107,7 @@ static void lok_doc_view_init (LOKDocView* pDocView)
     priv.m_pImpl = new LOKDocViewPrivateImpl();
     priv->m_pHandle = new ViewHandle;
     g_weak_ref_init(&priv->m_pHandle->m_aView, pDocView);
+    priv->m_pClipboardCancellable = g_cancellable_new();
     priv->m_pPaintPool = g_thread_pool_new_full(paintTileInThread, nullptr, freePaintRequest,
                                                 /*max_threads=*/1, /*exclusive=*/FALSE, nullptr);
 
@@ -1978,6 +2336,12 @@ static void lok_doc_view_dispose (GObject* object)
         priv->m_pFocusController = nullptr;
         priv->m_pKeyController = nullptr;
 
+        // Pending clipboard reads find the view gone via the handle; cancel
+        // them anyway. What we published stays on the system clipboard.
+        g_cancellable_cancel(priv->m_pClipboardCancellable);
+        if (g_pLastActiveHandle == priv->m_pHandle)
+            g_pLastActiveHandle = nullptr;
+
         // Stop painting before the document goes away: drop queued requests
         // and wait for the running one. Must not hold g_aLOKMutex here, the
         // worker needs it to finish.
@@ -2038,6 +2402,9 @@ static void lok_doc_view_finalize (GObject* object)
         g_object_unref(priv->m_pVAdjustment);
     }
     // m_pHandle is intentionally leaked, see ViewHandle.
+    g_clear_object(&priv->m_pExportedContent);
+    g_clear_pointer(&priv->m_pLastPasteData, g_bytes_unref);
+    g_clear_object(&priv->m_pClipboardCancellable);
 
     delete priv.m_pImpl;
     priv.m_pImpl = nullptr;
@@ -2726,6 +3093,7 @@ static bool isViewOnlyCommand(const gchar* pCommand)
         ".uno:TableBoundaries",    // deprecated 25.2
         ".uno:ViewBounds",         // text boundaries, deprecated 25.2
         ".uno:SectionBoundaries",  // deprecated 25.2
+        ".uno:Copy",               // reads the selection only
     };
     for (const char* pViewCommand : aCommands)
         if (g_strcmp0(pCommand, pViewCommand) == 0)
@@ -3247,10 +3615,25 @@ lok_doc_view_post_command (LOKDocView* pDocView,
     if (!priv->m_pDocument)
         return;
 
-    if (priv->m_bEdit || isViewOnlyCommand(pCommand))
-        LOKPostCommand(pDocView, pCommand, pArguments, bNotifyWhenFinished);
-    else
+    setActiveView(pDocView);
+    if (!priv->m_bEdit && !isViewOnlyCommand(pCommand))
+    {
         g_info ("LOK_POST_COMMAND: ignoring commands in view-only mode");
+        return;
+    }
+
+    // Paste from / copy to the system clipboard, not just LOK's internal one.
+    if (g_strcmp0(pCommand, ".uno:Paste") == 0 || g_strcmp0(pCommand, ".uno:PasteUnformattedText") == 0)
+    {
+        pasteFromClipboard(pDocView, g_strcmp0(pCommand, ".uno:PasteUnformattedText") == 0);
+        return;
+    }
+    if (g_strcmp0(pCommand, ".uno:Copy") == 0 || g_strcmp0(pCommand, ".uno:Cut") == 0)
+    {
+        postClipboardCommand(pDocView, pCommand, !bNotifyWhenFinished);
+        return;
+    }
+    LOKPostCommand(pDocView, pCommand, pArguments, bNotifyWhenFinished);
 }
 
 LOK_DOC_VIEW_DLLPUBLIC gchar *
@@ -3314,21 +3697,9 @@ lok_doc_view_paste (LOKDocView* pDocView,
                     gsize nSize)
 {
     LOKDocViewPrivate& priv = getPrivate(pDocView);
-    LibreOfficeKitDocument* pDocument = priv->m_pDocument;
-
-    if (!pDocument || !pData)
-        return false;
-
-    if (!priv->m_bEdit)
-    {
+    if (priv->m_pDocument && !priv->m_bEdit)
         g_info ("ignoring paste in view-only mode");
-        return false;
-    }
-
-    g_info("lok::Document::paste('%s', %" G_GSIZE_FORMAT " bytes)", pMimeType, nSize);
-    std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
-    setDocumentView(pDocument, priv->m_nViewId);
-    return pDocument->pClass->paste(pDocument, pMimeType, pData, nSize);
+    return pasteData(pDocView, pMimeType, pData, nSize);
 }
 
 LOK_DOC_VIEW_DLLPUBLIC void
