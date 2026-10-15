@@ -36,6 +36,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -183,6 +184,21 @@ struct LOKDocViewPrivateImpl
     /// is over the document.
     std::string m_aPointerName = "default";
     bool m_bPointerInDocument = false;
+
+    /// Input method (dead keys, compose, CJK, ...). Attached to the key
+    /// controller only while editing and focused, see updateIMContext().
+    GtkIMContext* m_pIMContext = nullptr;
+    /// Owned by the widget.
+    GtkEventControllerKey* m_pKeyController = nullptr;
+    bool m_bIMActive = false;
+    /// Whether LOK currently has a composition (LOK_EXT_TEXTINPUT) open.
+    bool m_bPreediting = false;
+    /// Last cursor location told to the IM (widget coordinates).
+    GdkRectangle m_aIMCursorLocation = {};
+    /// Keys whose press was posted to LOK, by hardware keycode, with the
+    /// keyval/state of the press: only those get a KEYUP, and with the same
+    /// keyval even if Shift was released first.
+    std::map<guint, std::pair<guint, GdkModifierType>> m_aKeysDown;
 
     // Overlay state, in document twips (LOK draws none of this into tiles).
     /// Own text cursor (LOK_CALLBACK_INVALIDATE_VISIBLE_CURSOR); width may be 0.
@@ -958,6 +974,8 @@ static void appendTiles(GtkSnapshot* pSnapshot, const TileBuffer& rTiles, float 
     }
 }
 
+static void updateIMCursorLocation(LOKDocView* pDocView);
+
 static void appendRectangleOutline(GtkSnapshot* pSnapshot, const graphene_rect_t& rRect, float fWidth, const GdkRGBA& rColor)
 {
     GskRoundedRect aRounded;
@@ -1102,6 +1120,8 @@ static void lok_doc_view_snapshot(GtkWidget* pWidget, GtkSnapshot* pSnapshot)
 
     gtk_snapshot_pop(pSnapshot);
     gtk_snapshot_restore(pSnapshot);
+
+    updateIMCursorLocation(pDocView);
 }
 
 static void lok_doc_view_measure(GtkWidget* pWidget, GtkOrientation eOrientation, int /*nForSize*/,
@@ -1386,16 +1406,170 @@ static bool postKey(LOKDocView* pDocView, int nType, guint nKeyval, GdkModifierT
     return true;
 }
 
-// TODO: attach a GtkIMMulticontext (gtk_event_controller_key_set_im_context)
-// and post committed text, for dead keys / compose / input methods.
-static gboolean onKeyPressed(GtkEventControllerKey*, guint nKeyval, guint, GdkModifierType eState, gpointer pData)
+// With an IM attached, the key controller only emits key-pressed for keys the
+// IM didn't consume: navigation, editing and shortcut keys. Text arrives via
+// the IM's commit/preedit signals below.
+static gboolean onKeyPressed(GtkEventControllerKey*, guint nKeyval, guint nKeycode, GdkModifierType eState, gpointer pData)
 {
-    return postKey(LOK_DOC_VIEW(pData), LOK_KEYEVENT_KEYINPUT, nKeyval, eState);
+    LOKDocView* pDocView = LOK_DOC_VIEW(pData);
+    if (!postKey(pDocView, LOK_KEYEVENT_KEYINPUT, nKeyval, eState))
+        return FALSE;
+    getPrivate(pDocView)->m_aKeysDown[nKeycode] = { nKeyval, eState };
+    return TRUE;
 }
 
-static void onKeyReleased(GtkEventControllerKey*, guint nKeyval, guint, GdkModifierType eState, gpointer pData)
+static void onKeyReleased(GtkEventControllerKey*, guint /*nKeyval*/, guint nKeycode, GdkModifierType, gpointer pData)
 {
-    postKey(LOK_DOC_VIEW(pData), LOK_KEYEVENT_KEYUP, nKeyval, eState);
+    // Only keys whose press we posted; text typed through the IM got its
+    // KEYUP together with the commit.
+    LOKDocView* pDocView = LOK_DOC_VIEW(pData);
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    auto it = priv->m_aKeysDown.find(nKeycode);
+    if (it == priv->m_aKeysDown.end())
+        return;
+    auto [nKeyval, eState] = it->second;
+    priv->m_aKeysDown.erase(it);
+    postKey(pDocView, LOK_KEYEVENT_KEYUP, nKeyval, eState);
+}
+
+/// LOK's IME path (postWindowExtTextInputEvent, window 0 = the document):
+/// LOK_EXT_TEXTINPUT sets the whole composition text, LOK_EXT_TEXTINPUT_END
+/// finishes it.
+static void postExtTextInput(LOKDocViewPrivate& priv, int nType, const char* pText)
+{
+    std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
+    setDocumentView(priv->m_pDocument, priv->m_nViewId);
+    priv->m_pDocument->pClass->postWindowExtTextInputEvent(priv->m_pDocument, 0, nType, pText);
+}
+
+static void onIMCommit(GtkIMContext*, const char* pText, gpointer pData)
+{
+    LOKDocViewPrivate& priv = getPrivate(LOK_DOC_VIEW(pData));
+    if (!priv->m_pDocument || !priv->m_bEdit || !pText || !*pText)
+        return;
+
+    // A single character outside a composition (plain typing, compose
+    // results, most dead keys): post it as a key press, so it behaves exactly
+    // like typing did before, e.g. for Writer's autocorrect.
+    if (!priv->m_bPreediting && g_utf8_strlen(pText, -1) == 1)
+    {
+        gunichar nChar = g_utf8_get_char(pText);
+        std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
+        setDocumentView(priv->m_pDocument, priv->m_nViewId);
+        priv->m_pDocument->pClass->postKeyEvent(priv->m_pDocument, LOK_KEYEVENT_KEYINPUT, nChar, 0);
+        priv->m_pDocument->pClass->postKeyEvent(priv->m_pDocument, LOK_KEYEVENT_KEYUP, nChar, 0);
+        return;
+    }
+
+    // Replace the composition (if any) with the committed text and finish it.
+    postExtTextInput(priv, LOK_EXT_TEXTINPUT, pText);
+    postExtTextInput(priv, LOK_EXT_TEXTINPUT_END, "");
+    priv->m_bPreediting = false;
+}
+
+static void onIMPreeditChanged(GtkIMContext* pContext, gpointer pData)
+{
+    LOKDocViewPrivate& priv = getPrivate(LOK_DOC_VIEW(pData));
+    if (!priv->m_pDocument || !priv->m_bEdit)
+        return;
+
+    // LOK draws the composition (underlined) itself, so the attributes and
+    // the preedit cursor position aren't needed.
+    g_autofree char* pPreedit = nullptr;
+    gtk_im_context_get_preedit_string(pContext, &pPreedit, nullptr, nullptr);
+    if (pPreedit && *pPreedit)
+    {
+        postExtTextInput(priv, LOK_EXT_TEXTINPUT, pPreedit);
+        priv->m_bPreediting = true;
+    }
+    else if (priv->m_bPreediting)
+    {
+        // Composition cancelled (a commit, if any, re-inserts its own text).
+        postExtTextInput(priv, LOK_EXT_TEXTINPUT, "");
+        postExtTextInput(priv, LOK_EXT_TEXTINPUT_END, "");
+        priv->m_bPreediting = false;
+    }
+}
+
+static gboolean onIMDeleteSurrounding(GtkIMContext*, int nOffset, int nChars, gpointer pData)
+{
+    LOKDocViewPrivate& priv = getPrivate(LOK_DOC_VIEW(pData));
+    // The range is [nOffset, nOffset + nChars) relative to the cursor; LOK
+    // can only delete a range touching the cursor.
+    if (!priv->m_pDocument || !priv->m_bEdit || nOffset > 0 || nOffset + nChars < 0)
+        return FALSE;
+
+    int nBefore = std::min(-nOffset, nChars);
+    std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
+    setDocumentView(priv->m_pDocument, priv->m_nViewId);
+    priv->m_pDocument->pClass->removeTextContext(priv->m_pDocument, 0, nBefore, nChars - nBefore);
+    return TRUE;
+}
+// TODO: retrieve-surrounding (LOK has no cheap way to get the text around
+// the cursor), so IMs relying on surrounding text get less context.
+
+/// The IM is attached and focused only while editing with focus, so input
+/// methods don't pop up candidate windows on a read-only view.
+static void updateIMContext(LOKDocView* pDocView)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    if (!priv->m_pIMContext || !priv->m_pKeyController)
+        return;
+
+    bool bActive = priv->m_bEdit && priv->m_pFocusController
+                   && gtk_event_controller_focus_is_focus(priv->m_pFocusController);
+    if (bActive == priv->m_bIMActive)
+        return;
+    priv->m_bIMActive = bActive;
+
+    if (bActive)
+    {
+        gtk_event_controller_key_set_im_context(priv->m_pKeyController, priv->m_pIMContext);
+        gtk_im_context_focus_in(priv->m_pIMContext);
+        priv->m_aIMCursorLocation = {}; // re-send on next draw
+        gtk_widget_queue_draw(GTK_WIDGET(pDocView));
+    }
+    else
+    {
+        // Drop an unfinished composition rather than leave it dangling in the document.
+        if (priv->m_bPreediting && priv->m_pDocument)
+        {
+            postExtTextInput(priv, LOK_EXT_TEXTINPUT, "");
+            postExtTextInput(priv, LOK_EXT_TEXTINPUT_END, "");
+        }
+        priv->m_bPreediting = false;
+        gtk_im_context_reset(priv->m_pIMContext);
+        gtk_im_context_focus_out(priv->m_pIMContext);
+        gtk_event_controller_key_set_im_context(priv->m_pKeyController, nullptr);
+    }
+}
+
+/// Tells the IM where the text cursor is (for candidate window placement).
+/// Called from snapshot, which runs after anything that moves it: cursor
+/// moves, scrolling, zooming.
+static void updateIMCursorLocation(LOKDocView* pDocView)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    if (!priv->m_bIMActive || isEmptyRectangle(priv->m_aVisibleCursor))
+        return;
+
+    double fOriginX, fOriginY;
+    getDocumentOrigin(pDocView, fOriginX, fOriginY);
+    const GdkRectangle& rCursor = priv->m_aVisibleCursor;
+    GdkRectangle aLocation = { static_cast<int>(fOriginX + twipToPixel(rCursor.x, priv->m_fZoom)),
+                               static_cast<int>(fOriginY + twipToPixel(rCursor.y, priv->m_fZoom)),
+                               std::max(1, static_cast<int>(twipToPixel(rCursor.width, priv->m_fZoom))),
+                               std::max(1, static_cast<int>(twipToPixel(rCursor.height, priv->m_fZoom))) };
+    if (gdk_rectangle_equal(&aLocation, &priv->m_aIMCursorLocation))
+        return;
+    priv->m_aIMCursorLocation = aLocation;
+    gtk_im_context_set_cursor_location(priv->m_pIMContext, &aLocation);
+}
+
+static void onFocusChanged(LOKDocView* pDocView)
+{
+    restartCursorBlink(pDocView);
+    updateIMContext(pDocView);
 }
 
 // ---------------------------------------------------------------------------
@@ -1523,15 +1697,22 @@ static void lok_doc_view_init (LOKDocView* pDocView)
     gtk_widget_add_controller(pWidget, pMotion);
 
     GtkEventController* pKey = gtk_event_controller_key_new();
+    priv->m_pKeyController = GTK_EVENT_CONTROLLER_KEY(pKey);
     g_signal_connect(pKey, "key-pressed", G_CALLBACK(onKeyPressed), pDocView);
     g_signal_connect(pKey, "key-released", G_CALLBACK(onKeyReleased), pDocView);
     gtk_widget_add_controller(pWidget, pKey);
 
-    // The cursor is only shown (and blinks) while focused.
+    priv->m_pIMContext = gtk_im_multicontext_new();
+    gtk_im_context_set_client_widget(priv->m_pIMContext, pWidget);
+    g_signal_connect(priv->m_pIMContext, "commit", G_CALLBACK(onIMCommit), pDocView);
+    g_signal_connect(priv->m_pIMContext, "preedit-changed", G_CALLBACK(onIMPreeditChanged), pDocView);
+    g_signal_connect(priv->m_pIMContext, "delete-surrounding", G_CALLBACK(onIMDeleteSurrounding), pDocView);
+
+    // The cursor is only shown (and blinks), and the IM only active, while focused.
     GtkEventController* pFocus = gtk_event_controller_focus_new();
     priv->m_pFocusController = GTK_EVENT_CONTROLLER_FOCUS(pFocus);
-    g_signal_connect_swapped(pFocus, "enter", G_CALLBACK(restartCursorBlink), pDocView);
-    g_signal_connect_swapped(pFocus, "leave", G_CALLBACK(restartCursorBlink), pDocView);
+    g_signal_connect_swapped(pFocus, "enter", G_CALLBACK(onFocusChanged), pDocView);
+    g_signal_connect_swapped(pFocus, "leave", G_CALLBACK(onFocusChanged), pDocView);
     gtk_widget_add_controller(pWidget, pFocus);
 
     g_signal_connect(pDocView, "notify::scale-factor", G_CALLBACK(onScaleFactorChanged), nullptr);
@@ -1699,8 +1880,16 @@ static void lok_doc_view_dispose (GObject* object)
         g_weak_ref_set(&priv->m_pHandle->m_aView, nullptr);
         g_clear_handle_id(&priv->m_nBlinkTimeoutId, g_source_remove);
         g_clear_handle_id(&priv->m_nHoverRetryId, g_source_remove);
+        // Before the document goes: the IM handlers post to it.
+        if (priv->m_pIMContext)
+        {
+            g_signal_handlers_disconnect_by_data(priv->m_pIMContext, pDocView);
+            gtk_im_context_set_client_widget(priv->m_pIMContext, nullptr);
+            g_clear_object(&priv->m_pIMContext);
+        }
         // GtkWidget's dispose frees the controllers.
         priv->m_pFocusController = nullptr;
+        priv->m_pKeyController = nullptr;
 
         // Stop painting before the document goes away: drop queued requests
         // and wait for the running one. Must not hold g_aLOKMutex here, the
@@ -2891,7 +3080,9 @@ lok_doc_view_set_edit(LOKDocView* pDocView,
         g_info("lok_doc_view_set_edit: entering edit mode");
 
     priv->m_bEdit = bEdit;
-    restartCursorBlink(pDocView); // the cursor is only shown in edit mode
+    // The cursor is only shown, and the IM only active, in edit mode.
+    restartCursorBlink(pDocView);
+    updateIMContext(pDocView);
     // NB: the GTK3 widget emitted the *old* value here, contrary to its docs.
     g_signal_emit(pDocView, doc_view_signals[EDIT_CHANGED], 0, bEdit);
     g_object_notify_by_pspec(G_OBJECT(pDocView), properties[PROP_EDITABLE]);

@@ -83,6 +83,13 @@ Done:
   the UI never waits behind a tile paint; latest position retried), LOK answers with
   `LOK_CALLBACK_MOUSE_POINTER` CSS names → `gtk_widget_set_cursor_from_name()`. Also in view-only
   mode, unlike the GTK3 widget.
+- Input method: `GtkIMMulticontext` on the key controller, attached only while editing and focused.
+  Single-character commits outside a composition go through `postKeyEvent` (same as typing, keeps
+  autocorrect); preedit and other commits through `postWindowExtTextInputEvent` (window 0 =
+  document; `LOK_EXT_TEXTINPUT` sets the whole composition, `_END` finishes it).
+  `delete-surrounding` → `removeTextContext`. Candidate window follows the cursor
+  (`set_cursor_location` from snapshot). KEYUP only for keys whose press was posted, matched by
+  hardware keycode.
 - `demo/main.c` — plain-C viewer (zoom, edit toggle, progress, status).
 - Upstream's vcl/awt/boost deps replaced: local `MOUSE_*`/`KEY_*`/`AwtKey` constants, json-glib.
 
@@ -119,7 +126,7 @@ Rendering notes (LibreOffice behaviour, not ours):
 ## Next steps
 1. Overlays still missing: other views' cursors/selections, content controls, touch selection
    handles (upstream PNGs), dragging graphic handles via `setGraphicSelection()`.
-2. IM context (`GtkIMMulticontext`), `setClientVisibleArea`.
+2. `setClientVisibleArea`; IM `retrieve-surrounding` (needs text around the cursor from LOK).
 3. Zoom anchoring, fractional scaling, part-aware invalidation; center-out tile order + prefetch.
 4. Clipboard (`GdkClipboard`), comments, multi-view (`new_from_widget`), dialogs; port gtktiledviewer as test app.
 
