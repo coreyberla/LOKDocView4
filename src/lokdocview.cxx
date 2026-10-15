@@ -245,6 +245,10 @@ struct LOKDocViewPrivateImpl
     /// Commands we asked a result for only for our own use; their
     /// LOK_CALLBACK_UNO_COMMAND_RESULT isn't emitted as command-result.
     std::multiset<std::string> m_aInternalCommandResults;
+    /// Debounce for publishing the primary selection.
+    guint m_nPrimaryTimeoutId = 0;
+    /// The current press is a middle click, handled as primary paste.
+    bool m_bMiddleClick = false;
 
     // Overlay state, in document twips (LOK draws none of this into tiles).
     /// Own text cursor (LOK_CALLBACK_INVALIDATE_VISIBLE_CURSOR); width may be 0.
@@ -674,6 +678,10 @@ static bool pasteData(LOKDocView* pDocView, const char* pMimeType, const char* p
     priv->m_aLastPasteMimeType = pMimeType;
     g_clear_pointer(&priv->m_pLastPasteData, g_bytes_unref);
     priv->m_pLastPasteData = g_bytes_new(pData, nSize);
+    // paste() replaces LOK's clipboard, so it no longer holds what we
+    // exported: from now on paste our own content from the system clipboard
+    // too (its native format keeps the fidelity), not LOK's.
+    g_clear_object(&priv->m_pExportedContent);
 
     g_info("lok::Document::paste('%s', %" G_GSIZE_FORMAT " bytes)", pMimeType, nSize);
     std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
@@ -756,13 +764,14 @@ static void onPasteTexture(GObject* pSource, GAsyncResult* pResult, gpointer pDa
  * (all formats, full fidelity), otherwise the richest format available,
  * read asynchronously. bTextOnly: plain text only (unformatted paste).
  */
-static void pasteFromClipboard(LOKDocView* pDocView, bool bTextOnly)
+static void pasteFromClipboard(LOKDocView* pDocView, bool bTextOnly, GdkClipboard* pClipboard = nullptr)
 {
     LOKDocViewPrivate& priv = getPrivate(pDocView);
     if (!priv->m_pDocument || !priv->m_bEdit)
         return;
 
-    GdkClipboard* pClipboard = gtk_widget_get_clipboard(GTK_WIDGET(pDocView));
+    if (!pClipboard)
+        pClipboard = gtk_widget_get_clipboard(GTK_WIDGET(pDocView));
     if (!bTextOnly && priv->m_pExportedContent && gdk_clipboard_get_content(pClipboard) == priv->m_pExportedContent)
     {
         std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
@@ -821,6 +830,41 @@ static void postClipboardCommand(LOKDocView* pDocView, const char* pCommand, boo
     std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
     setDocumentView(priv->m_pDocument, priv->m_nViewId);
     priv->m_pDocument->pClass->postUnoCommand(priv->m_pDocument, pCommand, nullptr, true);
+}
+
+/// Puts the selected text on the primary selection (middle-click paste).
+static gboolean publishPrimarySelection(gpointer pData)
+{
+    LOKDocView* pDocView = LOK_DOC_VIEW(pData);
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    priv->m_nPrimaryTimeoutId = 0;
+    if (!priv->m_pDocument || priv->m_aTextSelectionRectangles.empty())
+        return G_SOURCE_REMOVE;
+
+    char* pUsedMimeType = nullptr;
+    char* pText;
+    {
+        std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
+        setDocumentView(priv->m_pDocument, priv->m_nViewId);
+        pText = priv->m_pDocument->pClass->getTextSelection(priv->m_pDocument, "text/plain;charset=utf-8", &pUsedMimeType);
+    }
+    if (pText && *pText)
+        gdk_clipboard_set_text(gtk_widget_get_primary_clipboard(GTK_WIDGET(pDocView)), pText);
+    free(pText);
+    free(pUsedMimeType);
+    return G_SOURCE_REMOVE;
+}
+
+/**
+ * Publishes the primary selection once the selection settles: while
+ * drag-selecting it changes many times a second, and fetching the text each
+ * time would be a LOK call per change.
+ */
+static void schedulePrimarySelection(LOKDocView* pDocView)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    g_clear_handle_id(&priv->m_nPrimaryTimeoutId, g_source_remove);
+    priv->m_nPrimaryTimeoutId = g_timeout_add(250, publishPrimarySelection, pDocView);
 }
 
 /// Clipboard shortcuts handled here rather than by LOK; true if consumed.
@@ -1193,6 +1237,9 @@ static void handleCallback(LOKDocView* pDocView, CallbackEvent* pEvent)
     case LOK_CALLBACK_TEXT_SELECTION:
         priv->m_aTextSelectionRectangles = payloadToRectangles(priv, pPayload);
         g_signal_emit(pDocView, doc_view_signals[TEXT_SELECTION], 0, gboolean(!priv->m_aTextSelectionRectangles.empty()));
+        // Like other X11/Wayland apps, a deselect leaves the primary selection as is.
+        if (!priv->m_aTextSelectionRectangles.empty())
+            schedulePrimarySelection(pDocView);
         gtk_widget_queue_draw(GTK_WIDGET(pDocView));
         break;
     case LOK_CALLBACK_TEXT_SELECTION_START:
@@ -1915,6 +1962,24 @@ static void onDragBegin(GtkGestureDrag* pGesture, double fX, double fY, gpointer
     gtk_widget_grab_focus(GTK_WIDGET(pDocView));
     setActiveView(pDocView);
 
+    // Middle click pastes the primary selection at the click, as elsewhere on
+    // X11/Wayland. Not passed to LOK: its "primary selection" is the same
+    // per-view LOK clipboard as Ctrl+C, so it would paste the last copy.
+    priv->m_bMiddleClick = nButton == GDK_BUTTON_MIDDLE;
+    if (priv->m_bMiddleClick)
+    {
+        if (priv->m_bEdit)
+        {
+            // Move the cursor there first. LOK processes mouse events
+            // asynchronously; the primary read normally takes longer, but
+            // the order isn't guaranteed.
+            postMouseEvent(pDocView, LOK_MOUSEEVENT_MOUSEBUTTONDOWN, fX, fY, 1, MOUSE_LEFT, 0);
+            postMouseEvent(pDocView, LOK_MOUSEEVENT_MOUSEBUTTONUP, fX, fY, 1, MOUSE_LEFT, 0);
+            pasteFromClipboard(pDocView, true, gtk_widget_get_primary_clipboard(GTK_WIDGET(pDocView)));
+        }
+        return;
+    }
+
     int nDoubleClickTime = 400;
     g_object_get(gtk_widget_get_settings(GTK_WIDGET(pDocView)), "gtk-double-click-time", &nDoubleClickTime, nullptr);
     if (nButton == priv->m_nLastPressButton && nTime - priv->m_nLastPressTime < guint32(nDoubleClickTime))
@@ -1934,6 +1999,8 @@ static void onDragUpdate(GtkGestureDrag* pGesture, double fOffsetX, double fOffs
 {
     LOKDocView* pDocView = LOK_DOC_VIEW(pData);
     LOKDocViewPrivate& priv = getPrivate(pDocView);
+    if (priv->m_bMiddleClick)
+        return;
     double fStartX, fStartY;
     gtk_gesture_drag_get_start_point(pGesture, &fStartX, &fStartY);
     postMouseEvent(pDocView, LOK_MOUSEEVENT_MOUSEMOVE, fStartX + fOffsetX, fStartY + fOffsetY, 1,
@@ -1946,6 +2013,8 @@ static void onDragEnd(GtkGestureDrag* pGesture, double fOffsetX, double fOffsetY
     LOKDocView* pDocView = LOK_DOC_VIEW(pData);
     LOKDocViewPrivate& priv = getPrivate(pDocView);
     guint nButton = gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(pGesture));
+    if (std::exchange(priv->m_bMiddleClick, false))
+        return;
     double fStartX, fStartY;
     gtk_gesture_drag_get_start_point(pGesture, &fStartX, &fStartY);
 
@@ -2541,6 +2610,7 @@ static void lok_doc_view_dispose (GObject* object)
         g_clear_handle_id(&priv->m_nBlinkTimeoutId, g_source_remove);
         g_clear_handle_id(&priv->m_nHoverRetryId, g_source_remove);
         g_clear_handle_id(&priv->m_nClientZoomIdleId, g_source_remove);
+        g_clear_handle_id(&priv->m_nPrimaryTimeoutId, g_source_remove);
         // Before the document goes: the IM handlers post to it.
         if (priv->m_pIMContext)
         {

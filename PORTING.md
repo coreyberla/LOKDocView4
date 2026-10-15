@@ -119,7 +119,13 @@ Done:
     `post_command`): our own content → `.uno:Paste` from LOK's clipboard; otherwise the richest
     available format, read async (bytes, or GDK conversions to texture → PNG / text), → `paste()`.
   - `paste()` itself triggers `CLIPBOARD_CHANGED`; it's recognised by matching the pasted bytes
-    and not echoed back to the system clipboard.
+    and not echoed back to the system clipboard. It also replaces LOK's clipboard, so afterwards
+    our own exported content is pasted from the system clipboard, not via `.uno:Paste`.
+  - Primary selection: selected text is published (debounced 250ms, `getTextSelection`) to
+    `gtk_widget_get_primary_clipboard()`; deselecting leaves it. Middle click isn't passed to LOK
+    (LOK's primary selection is the same per-view LOK clipboard as Ctrl+C): in edit mode it
+    left-clicks to place the cursor, then pastes the primary's text. LOK handles mouse events
+    asynchronously, so cursor-move-before-paste is likely, not guaranteed.
 - Zoom keeps a document point fixed (`setZoom()`): the view center for `lok_doc_view_set_zoom()`,
   the pointer for Ctrl+scroll, the gesture center for pinch (`GtkGestureZoom`). The scroll
   position is applied in `size_allocate`, once the adjustments know the new size; zoom steps
@@ -164,8 +170,7 @@ Rendering notes (LibreOffice behaviour, not ours):
 2. `setClientVisibleArea`; IM `retrieve-surrounding` (needs text around the cursor from LOK).
 3. Impress invalidation mode (normal/notes/master) isn't checked yet, only the part.
 4. Comments, multi-view (`new_from_widget`), dialogs; port gtktiledviewer as test app.
-5. Clipboard leftovers: primary selection (middle-click paste), lazy export (only convert the
-   formats another app actually requests).
+5. Clipboard leftover: lazy export (only convert the formats another app actually requests).
 
 ## TODO upstream (LibreOffice)
 - Exit-time crash: null-check `gClipboards.get()` in `LOKClipboardFactory::getClipboardForCurView()`
