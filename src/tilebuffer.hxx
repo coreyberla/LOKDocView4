@@ -38,11 +38,30 @@ float pixelToTwip(float fInput, float zoom);
 float twipToPixel(float fInput, float zoom);
 
 /**
-   Cache of rendered tiles, keyed by (column, row).
+   A cached tile.
+
+   A tile keeps showing its last texture while it is stale (invalidated) or
+   being re-rendered, so edits don't flicker.
+*/
+struct Tile
+{
+    /// Last rendered content, or nullptr if never rendered. Owned.
+    GdkTexture* m_pTexture = nullptr;
+    /// Whether m_pTexture reflects the current document content.
+    bool m_bValid = false;
+    /// Whether a paint request for this tile is queued or running.
+    bool m_bPending = false;
+    /// Bumped on every invalidation; a paint result is only valid if it was
+    /// requested at the current serial.
+    unsigned m_nSerial = 0;
+};
+
+/**
+   Cache of rendered tiles, keyed by (column, row), for one zoom level and
+   scale factor.
 
    GTK4 replacement for the cairo-surface based upstream TileBuffer: tiles are
    immutable GdkTextures that can be appended to a GtkSnapshot directly.
-   A tile that is missing from the cache needs to be (re)rendered.
 */
 class TileBuffer
 {
@@ -52,17 +71,26 @@ public:
     TileBuffer(const TileBuffer&) = delete;
     TileBuffer& operator=(const TileBuffer&) = delete;
 
-    /// Returns the cached tile (owned by the buffer) or nullptr if it must be rendered.
-    GdkTexture* getTile(int nColumn, int nRow) const;
-    /// Takes ownership of pTexture, replacing any previous tile at that position.
-    void setTile(int nColumn, int nRow, GdkTexture* pTexture);
-    /// Drops all tiles intersecting the given rectangle (in logical pixels).
+    /// Returns the tile or nullptr if it was never requested.
+    const Tile* findTile(int nColumn, int nRow) const;
+    /// Returns the tile, creating an empty one if needed.
+    Tile& getTile(int nColumn, int nRow);
+    /**
+       Stores a paint result. Takes ownership of pTexture. The tile becomes
+       valid unless it was invalidated after the paint was requested.
+    */
+    void setTile(int nColumn, int nRow, GdkTexture* pTexture, unsigned nRequestSerial);
+    /// Marks all tiles intersecting the given rectangle (in logical pixels) stale.
     void invalidate(const GdkRectangle& rRect);
-    /// Drops all tiles.
-    void resetAllTiles();
+    /// Marks all tiles stale.
+    void invalidateAll();
+    /// Whether any tile has content to show.
+    bool hasTextures() const;
 
 private:
-    std::map<std::pair<int, int>, GdkTexture*> m_aTiles;
+    void invalidateTile(Tile& rTile);
+
+    std::map<std::pair<int, int>, Tile> m_aTiles;
 };
 
 /* vim:set shiftwidth=4 softtabstop=4 expandtab: */

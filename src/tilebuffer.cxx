@@ -22,21 +22,34 @@ float twipToPixel(float fInput, float zoom)
 
 TileBuffer::~TileBuffer()
 {
-    resetAllTiles();
+    for (auto& rEntry : m_aTiles)
+        g_clear_object(&rEntry.second.m_pTexture);
 }
 
-GdkTexture* TileBuffer::getTile(int nColumn, int nRow) const
+const Tile* TileBuffer::findTile(int nColumn, int nRow) const
 {
     auto it = m_aTiles.find({ nColumn, nRow });
-    return it == m_aTiles.end() ? nullptr : it->second;
+    return it == m_aTiles.end() ? nullptr : &it->second;
 }
 
-void TileBuffer::setTile(int nColumn, int nRow, GdkTexture* pTexture)
+Tile& TileBuffer::getTile(int nColumn, int nRow)
 {
-    auto& rpTile = m_aTiles[{ nColumn, nRow }];
-    if (rpTile)
-        g_object_unref(rpTile);
-    rpTile = pTexture;
+    return m_aTiles[{ nColumn, nRow }];
+}
+
+void TileBuffer::setTile(int nColumn, int nRow, GdkTexture* pTexture, unsigned nRequestSerial)
+{
+    Tile& rTile = getTile(nColumn, nRow);
+    g_clear_object(&rTile.m_pTexture);
+    rTile.m_pTexture = pTexture;
+    rTile.m_bPending = false;
+    rTile.m_bValid = nRequestSerial == rTile.m_nSerial;
+}
+
+void TileBuffer::invalidateTile(Tile& rTile)
+{
+    rTile.m_bValid = false;
+    ++rTile.m_nSerial;
 }
 
 void TileBuffer::invalidate(const GdkRectangle& rRect)
@@ -49,24 +62,26 @@ void TileBuffer::invalidate(const GdkRectangle& rRect)
     int nColEnd = (rRect.x + rRect.width - 1) / nTileSizePixels;
     int nRowEnd = (rRect.y + rRect.height - 1) / nTileSizePixels;
 
-    for (auto it = m_aTiles.begin(); it != m_aTiles.end();)
+    for (auto& [rPosition, rTile] : m_aTiles)
     {
-        auto [nCol, nRow] = it->first;
+        auto [nCol, nRow] = rPosition;
         if (nCol >= nColStart && nCol <= nColEnd && nRow >= nRowStart && nRow <= nRowEnd)
-        {
-            g_object_unref(it->second);
-            it = m_aTiles.erase(it);
-        }
-        else
-            ++it;
+            invalidateTile(rTile);
     }
 }
 
-void TileBuffer::resetAllTiles()
+void TileBuffer::invalidateAll()
 {
     for (auto& rEntry : m_aTiles)
-        g_object_unref(rEntry.second);
-    m_aTiles.clear();
+        invalidateTile(rEntry.second);
+}
+
+bool TileBuffer::hasTextures() const
+{
+    for (const auto& rEntry : m_aTiles)
+        if (rEntry.second.m_pTexture)
+            return true;
+    return false;
 }
 
 /* vim:set shiftwidth=4 softtabstop=4 expandtab: */

@@ -31,6 +31,7 @@
 #include <json-glib/json-glib.h>
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
@@ -38,6 +39,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 
 #include "tilebuffer.hxx"
 
@@ -83,21 +85,32 @@ constexpr int DELETE = 1286;
 std::mutex g_aLOKMutex;
 
 /**
- * Context pointer handed to LOK's registerCallback().
+ * What asynchronous work (LOK callbacks, tile paints, their main-loop
+ * continuations) holds on to instead of the view itself.
+ *
+ * Holding a strong ref there would keep the widget alive after its window is
+ * closed, so dispose (which shuts LOK down) wouldn't run before the app exits,
+ * and LibreOffice's static destructors then crash or hang at exit. Instead,
+ * pending work re-acquires the view through the weak ref and drops out if
+ * it's gone.
  *
  * Deliberately never freed: LOK may still be inside a callback on its own
  * thread while the view is disposed, so we only clear the weak reference and
- * late callbacks become no-ops.
+ * late work becomes a no-op.
  */
-struct CallbackData
+struct ViewHandle
 {
     GWeakRef m_aView;
+    /// Bumped whenever the view's tile buffer is replaced (and on dispose).
+    /// Read by the paint worker, so stale queued requests are skipped and
+    /// stale results dropped.
+    std::atomic<unsigned> m_nTileGeneration{ 0 };
 };
 
-/// A LOK callback marshalled to the main loop. Holds a strong ref on the view.
+/// A LOK callback marshalled to the main loop.
 struct CallbackEvent
 {
-    LOKDocView* m_pDocView;
+    ViewHandle* m_pHandle;
     int m_nType;
     std::string m_aPayload;
 };
@@ -120,7 +133,15 @@ struct LOKDocViewPrivateImpl
     long m_nDocumentHeightTwips = 0;
     float m_fZoom = 1.0f;
     gint m_nScaleFactor = 1;
-    TileBuffer m_aTileBuffer;
+
+    /// Tiles for the current zoom level and scale factor.
+    std::unique_ptr<TileBuffer> m_pTileBuffer = std::make_unique<TileBuffer>();
+    /// Tiles of the previous zoom level, drawn scaled where current tiles are
+    /// still missing; dropped once the visible area is fully rendered.
+    std::unique_ptr<TileBuffer> m_pPreviousTiles;
+    float m_fPreviousZoom = 1.0f;
+    /// Single worker thread painting tiles (LOK can't paint in parallel).
+    GThreadPool* m_pPaintPool = nullptr;
 
     bool m_bEdit = false;
     bool m_bCanZoomIn = true;
@@ -151,7 +172,9 @@ struct LOKDocViewPrivateImpl
     guint32 m_nLastPressTime = 0;
     guint m_nLastPressButton = 0;
 
-    CallbackData* m_pCallbackData = nullptr;
+    ViewHandle* m_pHandle = nullptr;
+    /// Application held while a document loads, see lok_doc_view_open_document().
+    GApplication* m_pHeldApplication = nullptr;
 };
 
 struct LOKDocViewPrivateStruct
@@ -448,7 +471,7 @@ static void invalidateTiles(LOKDocView* pDocView, const std::string& rPayload)
     // TODO: honour the part number (LOK_FEATURE_PART_IN_INVALIDATION_CALLBACK)
     // and skip invalidations for other parts.
     if (bAll)
-        priv->m_aTileBuffer.resetAllTiles();
+        priv->m_pTileBuffer->invalidateAll();
     else
     {
         // Twips -> pixels, rounded outwards; clamp to avoid overflow on INT_MAX extents.
@@ -460,7 +483,7 @@ static void invalidateTiles(LOKDocView* pDocView, const std::string& rPayload)
                                  static_cast<int>(std::floor(fY)),
                                  static_cast<int>(std::ceil(toPixels(aTwips.width))) + 2,
                                  static_cast<int>(std::ceil(toPixels(aTwips.height))) + 2 };
-        priv->m_aTileBuffer.invalidate(aPixels);
+        priv->m_pTileBuffer->invalidate(aPixels);
     }
     gtk_widget_queue_draw(GTK_WIDGET(pDocView));
 }
@@ -477,9 +500,8 @@ static int countSearchResults(const std::string& rPayload)
     return pResults ? json_array_get_length(pResults) : 0;
 }
 
-static void handleCallback(CallbackEvent* pEvent)
+static void handleCallback(LOKDocView* pDocView, CallbackEvent* pEvent)
 {
-    LOKDocView* pDocView = pEvent->m_pDocView;
     LOKDocViewPrivate& priv = getPrivate(pDocView);
     const std::string& rPayload = pEvent->m_aPayload;
     const char* pPayload = rPayload.c_str();
@@ -566,25 +588,26 @@ static void handleCallback(CallbackEvent* pEvent)
 static gboolean callbackIdle(gpointer pData)
 {
     std::unique_ptr<CallbackEvent> pEvent(static_cast<CallbackEvent*>(pData));
-    if (!getPrivate(pEvent->m_pDocView)->m_bDisposed)
-        handleCallback(pEvent.get());
-    g_object_unref(pEvent->m_pDocView);
+    // Re-acquire the view; it may have been disposed since LOK called us.
+    if (gpointer pView = g_weak_ref_get(&pEvent->m_pHandle->m_aView))
+    {
+        LOKDocView* pDocView = LOK_DOC_VIEW(pView);
+        if (!getPrivate(pDocView)->m_bDisposed)
+            handleCallback(pDocView, pEvent.get());
+        g_object_unref(pDocView);
+    }
     return G_SOURCE_REMOVE;
 }
 
 /**
  * Called by LOK, possibly on its own thread and possibly synchronously from
  * inside a LOK call we made while holding g_aLOKMutex. So: never touch LOK
- * here, always defer to the main loop.
+ * here, always defer to the main loop. Also never take a strong ref here: if
+ * it were the last one, unreffing it would dispose the view on LOK's thread.
  */
 static void lokCallback(int nType, const char* pPayload, void* pData)
 {
-    auto* pCallbackData = static_cast<CallbackData*>(pData);
-    gpointer pDocView = g_weak_ref_get(&pCallbackData->m_aView);
-    if (!pDocView)
-        return;
-
-    auto* pEvent = new CallbackEvent{ LOK_DOC_VIEW(pDocView), nType, pPayload ? pPayload : "" };
+    auto* pEvent = new CallbackEvent{ static_cast<ViewHandle*>(pData), nType, pPayload ? pPayload : "" };
     g_idle_add_full(G_PRIORITY_DEFAULT, callbackIdle, pEvent, nullptr);
 }
 
@@ -592,32 +615,155 @@ static void lokCallback(int nType, const char* pPayload, void* pData)
 // Rendering
 // ---------------------------------------------------------------------------
 
-static GdkTexture* renderTile(LOKDocViewPrivate& priv, int nColumn, int nRow)
+namespace
 {
-    int nTilePixels = nTileSizePixels * priv->m_nScaleFactor;
-    int nTileTwips = getTileSizeTwips(priv);
-    gsize nStride = static_cast<gsize>(nTilePixels) * 4;
-    gsize nSize = nStride * nTilePixels;
-    // Must start zeroed (transparent): LOK leaves areas without content, e.g.
-    // Writer's margin around the pages, untouched.
-    auto* pBuffer = static_cast<guchar*>(g_malloc0(nSize));
+/// One tile to paint on the worker thread. Everything the worker needs is
+/// copied in, so it never reads view state except the handle's generation.
+struct PaintRequest
+{
+    ViewHandle* m_pHandle;
+    LibreOfficeKitDocument* m_pDocument;
+    int m_nViewId;
+    int m_eTileMode;
+    unsigned m_nGeneration;
+    unsigned m_nSerial;
+    int m_nColumn;
+    int m_nRow;
+    int m_nTilePixels;
+    int m_nTileTwips;
+    GdkTexture* m_pTexture = nullptr; // result
+};
+}
 
+static void freePaintRequest(gpointer pData)
+{
+    auto* pRequest = static_cast<PaintRequest*>(pData);
+    g_clear_object(&pRequest->m_pTexture);
+    delete pRequest;
+}
+
+/// Main loop: store a finished tile, unless it was superseded meanwhile.
+static gboolean paintTileDone(gpointer pData)
+{
+    auto* pRequest = static_cast<PaintRequest*>(pData);
+
+    // Generation check first: also covers dispose, which bumps it.
+    if (pRequest->m_pTexture && pRequest->m_nGeneration == pRequest->m_pHandle->m_nTileGeneration)
     {
-        // TODO: render on a worker thread (upstream LOK_PAINT_TILE) and show a
-        // placeholder meanwhile; synchronous painting blocks the UI.
-        std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
-        setDocumentView(priv->m_pDocument, priv->m_nViewId);
-        priv->m_pDocument->pClass->paintTile(priv->m_pDocument, pBuffer, nTilePixels, nTilePixels,
-                                             nColumn * nTileTwips, nRow * nTileTwips,
-                                             nTileTwips, nTileTwips);
+        if (gpointer pView = g_weak_ref_get(&pRequest->m_pHandle->m_aView))
+        {
+            LOKDocView* pDocView = LOK_DOC_VIEW(pView);
+            getPrivate(pDocView)->m_pTileBuffer->setTile(pRequest->m_nColumn, pRequest->m_nRow,
+                                                         std::exchange(pRequest->m_pTexture, nullptr),
+                                                         pRequest->m_nSerial);
+            gtk_widget_queue_draw(GTK_WIDGET(pDocView));
+            g_object_unref(pDocView);
+        }
     }
 
-    GdkMemoryFormat eFormat = priv->m_eTileMode == LOK_TILEMODE_RGBA ? GDK_MEMORY_R8G8B8A8_PREMULTIPLIED
-                                                                     : GDK_MEMORY_B8G8R8A8_PREMULTIPLIED;
-    GBytes* pBytes = g_bytes_new_take(pBuffer, nSize);
-    GdkTexture* pTexture = gdk_memory_texture_new(nTilePixels, nTilePixels, eFormat, pBytes, nStride);
-    g_bytes_unref(pBytes);
-    return pTexture;
+    freePaintRequest(pRequest);
+    return G_SOURCE_REMOVE;
+}
+
+/// Worker thread: paint one tile into a texture.
+static void paintTileInThread(gpointer pData, gpointer /*pUserData*/)
+{
+    auto* pRequest = static_cast<PaintRequest*>(pData);
+
+    // Skip requests superseded while queued (zoom change, part switch, dispose).
+    // Dispose waits for a running paint before destroying the document.
+    if (pRequest->m_nGeneration == pRequest->m_pHandle->m_nTileGeneration)
+    {
+        int nTilePixels = pRequest->m_nTilePixels;
+        int nTileTwips = pRequest->m_nTileTwips;
+        gsize nStride = static_cast<gsize>(nTilePixels) * 4;
+        gsize nSize = nStride * nTilePixels;
+        // Must start zeroed (transparent): LOK leaves areas without content, e.g.
+        // Writer's margin around the pages, untouched.
+        auto* pBuffer = static_cast<guchar*>(g_malloc0(nSize));
+
+        {
+            std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
+            setDocumentView(pRequest->m_pDocument, pRequest->m_nViewId);
+            pRequest->m_pDocument->pClass->paintTile(pRequest->m_pDocument, pBuffer, nTilePixels, nTilePixels,
+                                                     pRequest->m_nColumn * nTileTwips, pRequest->m_nRow * nTileTwips,
+                                                     nTileTwips, nTileTwips);
+        }
+
+        GdkMemoryFormat eFormat = pRequest->m_eTileMode == LOK_TILEMODE_RGBA ? GDK_MEMORY_R8G8B8A8_PREMULTIPLIED
+                                                                             : GDK_MEMORY_B8G8R8A8_PREMULTIPLIED;
+        GBytes* pBytes = g_bytes_new_take(pBuffer, nSize);
+        // GdkTexture is immutable and may be created off the main thread.
+        pRequest->m_pTexture = gdk_memory_texture_new(nTilePixels, nTilePixels, eFormat, pBytes, nStride);
+        g_bytes_unref(pBytes);
+    }
+
+    g_idle_add_full(G_PRIORITY_DEFAULT, paintTileDone, pRequest, nullptr);
+}
+
+static void requestTile(LOKDocView* pDocView, int nColumn, int nRow, Tile& rTile)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    rTile.m_bPending = true;
+
+    auto* pRequest = new PaintRequest{ priv->m_pHandle,
+                                       priv->m_pDocument,
+                                       priv->m_nViewId,
+                                       priv->m_eTileMode,
+                                       priv->m_pHandle->m_nTileGeneration,
+                                       rTile.m_nSerial,
+                                       nColumn,
+                                       nRow,
+                                       nTileSizePixels * priv->m_nScaleFactor,
+                                       getTileSizeTwips(priv) };
+    g_thread_pool_push(priv->m_pPaintPool, pRequest, nullptr);
+}
+
+/**
+ * Starts over with an empty tile buffer, e.g. on zoom or part change.
+ *
+ * With bKeepAsPlaceholder, the current tiles are kept (with the zoom they were
+ * rendered at, so call this before changing m_fZoom) and drawn scaled until
+ * the new ones arrive. If the current buffer is still empty, an older
+ * placeholder is kept instead, so rapid zoom steps don't blank the view.
+ */
+static void startNewTileGeneration(LOKDocView* pDocView, bool bKeepAsPlaceholder)
+{
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
+    ++priv->m_pHandle->m_nTileGeneration;
+
+    if (!bKeepAsPlaceholder)
+        priv->m_pPreviousTiles.reset();
+    else if (priv->m_pTileBuffer->hasTextures())
+    {
+        priv->m_pPreviousTiles = std::move(priv->m_pTileBuffer);
+        priv->m_fPreviousZoom = priv->m_fZoom;
+    }
+    priv->m_pTileBuffer = std::make_unique<TileBuffer>();
+    gtk_widget_queue_draw(GTK_WIDGET(pDocView));
+}
+
+/// Draws the textures of rTiles that intersect rRegion (current document pixels).
+/// fScale converts rTiles' pixel grid to the current one.
+static void appendTiles(GtkSnapshot* pSnapshot, const TileBuffer& rTiles, float fScale, const graphene_rect_t& rRegion)
+{
+    float fTile = nTileSizePixels * fScale;
+    int nColStart = static_cast<int>(rRegion.origin.x / fTile);
+    int nRowStart = static_cast<int>(rRegion.origin.y / fTile);
+    int nColEnd = static_cast<int>(std::ceil((rRegion.origin.x + rRegion.size.width) / fTile));
+    int nRowEnd = static_cast<int>(std::ceil((rRegion.origin.y + rRegion.size.height) / fTile));
+
+    for (int nRow = nRowStart; nRow < nRowEnd; ++nRow)
+    {
+        for (int nColumn = nColStart; nColumn < nColEnd; ++nColumn)
+        {
+            const Tile* pTile = rTiles.findTile(nColumn, nRow);
+            if (!pTile || !pTile->m_pTexture)
+                continue;
+            graphene_rect_t aRect = GRAPHENE_RECT_INIT(nColumn * fTile, nRow * fTile, fTile, fTile);
+            gtk_snapshot_append_texture(pSnapshot, pTile->m_pTexture, &aRect);
+        }
+    }
 }
 
 static void lok_doc_view_snapshot(GtkWidget* pWidget, GtkSnapshot* pSnapshot)
@@ -634,10 +780,14 @@ static void lok_doc_view_snapshot(GtkWidget* pWidget, GtkSnapshot* pSnapshot)
     double fOriginX, fOriginY;
     getDocumentOrigin(pDocView, fOriginX, fOriginY);
 
-    graphene_rect_t aDocRect = GRAPHENE_RECT_INIT(float(fOriginX), float(fOriginY), float(fDocWidth), float(fDocHeight));
+    // Everything below is in document pixels.
+    gtk_snapshot_save(pSnapshot);
+    graphene_point_t aOrigin = GRAPHENE_POINT_INIT(float(fOriginX), float(fOriginY));
+    gtk_snapshot_translate(pSnapshot, &aOrigin);
+    graphene_rect_t aDocRect = GRAPHENE_RECT_INIT(0, 0, float(fDocWidth), float(fDocHeight));
     gtk_snapshot_push_clip(pSnapshot, &aDocRect);
 
-    // Visible part of the document, in document pixels.
+    // Visible part of the document.
     double fVisLeft = std::max(0.0, -fOriginX);
     double fVisTop = std::max(0.0, -fOriginY);
     double fVisRight = std::min(fDocWidth, nWidth - fOriginX);
@@ -648,24 +798,44 @@ static void lok_doc_view_snapshot(GtkWidget* pWidget, GtkSnapshot* pSnapshot)
     int nColEnd = static_cast<int>(std::ceil(fVisRight / nTileSizePixels));
     int nRowEnd = static_cast<int>(std::ceil(fVisBottom / nTileSizePixels));
 
+    // TODO: request tiles nearest the viewport center first, and prefetch
+    // one row/column beyond the visible area.
+    bool bComplete = true;
     for (int nRow = nRowStart; nRow < nRowEnd; ++nRow)
     {
         for (int nColumn = nColStart; nColumn < nColEnd; ++nColumn)
         {
-            GdkTexture* pTexture = priv->m_aTileBuffer.getTile(nColumn, nRow);
-            if (!pTexture)
-            {
-                pTexture = renderTile(priv, nColumn, nRow);
-                priv->m_aTileBuffer.setTile(nColumn, nRow, pTexture);
-            }
-            graphene_rect_t aTileRect = GRAPHENE_RECT_INIT(float(fOriginX + nColumn * nTileSizePixels),
-                                                           float(fOriginY + nRow * nTileSizePixels),
+            Tile& rTile = priv->m_pTileBuffer->getTile(nColumn, nRow);
+            if (!rTile.m_bValid && !rTile.m_bPending)
+                requestTile(pDocView, nColumn, nRow, rTile);
+
+            graphene_rect_t aTileRect = GRAPHENE_RECT_INIT(float(nColumn * nTileSizePixels), float(nRow * nTileSizePixels),
                                                            float(nTileSizePixels), float(nTileSizePixels));
-            gtk_snapshot_append_texture(pSnapshot, pTexture, &aTileRect);
+            if (rTile.m_pTexture)
+            {
+                // Possibly stale: shown until its replacement arrives, to avoid flicker.
+                gtk_snapshot_append_texture(pSnapshot, rTile.m_pTexture, &aTileRect);
+            }
+            else
+            {
+                bComplete = false;
+                // Not rendered yet: fill with the previous zoom level's tiles, scaled.
+                // Clipped to this tile, so it can't show through transparent
+                // areas of tiles that are already there.
+                if (priv->m_pPreviousTiles)
+                {
+                    gtk_snapshot_push_clip(pSnapshot, &aTileRect);
+                    appendTiles(pSnapshot, *priv->m_pPreviousTiles, priv->m_fZoom / priv->m_fPreviousZoom, aTileRect);
+                    gtk_snapshot_pop(pSnapshot);
+                }
+            }
         }
     }
+    if (bComplete)
+        priv->m_pPreviousTiles.reset();
 
     gtk_snapshot_pop(pSnapshot);
+    gtk_snapshot_restore(pSnapshot);
 
     // TODO: overlays (cursor, selections, handles, graphic selection, other
     // views) — upstream renderOverlay(); use gtk_snapshot_append_color() or
@@ -695,9 +865,9 @@ static void onScaleFactorChanged(GObject* pObject, GParamSpec*, gpointer)
     LOKDocViewPrivate& priv = getPrivate(pDocView);
     // TODO: fractional scaling (gdk_surface_get_scale()).
     priv->m_nScaleFactor = gtk_widget_get_scale_factor(GTK_WIDGET(pDocView));
-    priv->m_aTileBuffer.resetAllTiles();
+    // Same layout, new resolution: old tiles are a fine placeholder.
+    startNewTileGeneration(pDocView, true);
     updateClientZoom(pDocView);
-    gtk_widget_queue_draw(GTK_WIDGET(pDocView));
 }
 
 // ---------------------------------------------------------------------------
@@ -918,13 +1088,13 @@ static void postDocumentLoad(LOKDocView* pDocView)
         pDocument->pClass->initializeForRendering(pDocument, priv->m_aRenderingArguments.c_str());
         // initializeForRendering() may change the view id in Impress, so query it afterwards.
         priv->m_nViewId = pDocument->pClass->getView(pDocument);
-        pDocument->pClass->registerCallback(pDocument, lokCallback, priv->m_pCallbackData);
+        pDocument->pClass->registerCallback(pDocument, lokCallback, priv->m_pHandle);
         priv->m_eTileMode = pDocument->pClass->getTileMode(pDocument);
         priv->m_nParts = pDocument->pClass->getParts(pDocument);
         priv->m_nPartId = pDocument->pClass->getPart(pDocument);
     }
 
-    priv->m_aTileBuffer.resetAllTiles();
+    startNewTileGeneration(pDocView, false);
     refreshSize(pDocView);
     updateClientZoom(pDocView);
 
@@ -959,13 +1129,26 @@ static void openDocumentDone(GObject* pSource, GAsyncResult* pResult, gpointer p
     GTask* pOuterTask = G_TASK(pData);
     GError* pError = nullptr;
 
+    if (priv->m_pHeldApplication)
+    {
+        g_debug("load finished, releasing application");
+        g_application_release(priv->m_pHeldApplication);
+        g_clear_object(&priv->m_pHeldApplication);
+    }
+
     auto* pDocument = static_cast<LibreOfficeKitDocument*>(g_task_propagate_pointer(G_TASK(pResult), &pError));
     if (!pDocument || priv->m_bDisposed)
     {
         if (pDocument)
         {
+            // Explicitly disposed mid-load: dispose had no document to close yet.
             std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
             pDocument->pClass->destroy(pDocument);
+            if (priv->m_bDisposed && priv->m_pOffice && priv->m_pOffice->pClass->getDocsCount(priv->m_pOffice) == 0)
+            {
+                priv->m_pOffice->pClass->destroy(priv->m_pOffice);
+                priv->m_pOffice = nullptr;
+            }
         }
         setIsLoading(pDocView, false);
         if (pError)
@@ -990,8 +1173,10 @@ static void lok_doc_view_init (LOKDocView* pDocView)
 {
     LOKDocViewPrivate& priv = getPrivate(pDocView);
     priv.m_pImpl = new LOKDocViewPrivateImpl();
-    priv->m_pCallbackData = new CallbackData;
-    g_weak_ref_init(&priv->m_pCallbackData->m_aView, pDocView);
+    priv->m_pHandle = new ViewHandle;
+    g_weak_ref_init(&priv->m_pHandle->m_aView, pDocView);
+    priv->m_pPaintPool = g_thread_pool_new_full(paintTileInThread, nullptr, freePaintRequest,
+                                                /*max_threads=*/1, /*exclusive=*/FALSE, nullptr);
 
     GtkWidget* pWidget = GTK_WIDGET(pDocView);
     gtk_widget_set_focusable(pWidget, TRUE);
@@ -1173,8 +1358,20 @@ static void lok_doc_view_dispose (GObject* object)
 
     if (!priv->m_bDisposed)
     {
+        g_debug("dispose: start");
         priv->m_bDisposed = true;
-        g_weak_ref_set(&priv->m_pCallbackData->m_aView, nullptr);
+        g_weak_ref_set(&priv->m_pHandle->m_aView, nullptr);
+
+        // Stop painting before the document goes away: drop queued requests
+        // and wait for the running one. Must not hold g_aLOKMutex here, the
+        // worker needs it to finish.
+        ++priv->m_pHandle->m_nTileGeneration;
+        if (priv->m_pPaintPool)
+        {
+            g_debug("dispose: stopping paint worker");
+            g_thread_pool_free(priv->m_pPaintPool, /*immediate=*/TRUE, /*wait=*/TRUE);
+            priv->m_pPaintPool = nullptr;
+        }
 
         std::unique_lock<std::mutex> aGuard(g_aLOKMutex);
         if (priv->m_pDocument)
@@ -1183,13 +1380,16 @@ static void lok_doc_view_dispose (GObject* object)
             priv->m_pDocument->pClass->registerCallback(priv->m_pDocument, nullptr, nullptr);
 
             // This call may drop several views - e.g., embedded OLE in-place clients
+            g_debug("dispose: destroying view %d", priv->m_nViewId);
             priv->m_pDocument->pClass->destroyView(priv->m_pDocument, priv->m_nViewId);
             if (priv->m_pDocument->pClass->getViewsCount(priv->m_pDocument) == 0)
             {
                 // Last view(s) gone
+                g_debug("dispose: destroying document");
                 priv->m_pDocument->pClass->destroy(priv->m_pDocument);
                 if (priv->m_pOffice && priv->m_pOffice->pClass->getDocsCount(priv->m_pOffice) == 0)
                 {
+                    g_debug("dispose: destroying office");
                     priv->m_pOffice->pClass->destroy(priv->m_pOffice);
                     priv->m_pOffice = nullptr;
                 }
@@ -1197,8 +1397,10 @@ static void lok_doc_view_dispose (GObject* object)
             priv->m_pDocument = nullptr;
         }
         aGuard.unlock();
+        g_debug("dispose: done");
 
-        priv->m_aTileBuffer.resetAllTiles();
+        priv->m_pTileBuffer = std::make_unique<TileBuffer>();
+        priv->m_pPreviousTiles.reset();
     }
 
     G_OBJECT_CLASS (lok_doc_view_parent_class)->dispose (object);
@@ -1219,7 +1421,7 @@ static void lok_doc_view_finalize (GObject* object)
         g_signal_handlers_disconnect_by_func(priv->m_pVAdjustment, reinterpret_cast<gpointer>(onAdjustmentValueChanged), pDocView);
         g_object_unref(priv->m_pVAdjustment);
     }
-    // m_pCallbackData is intentionally leaked, see CallbackData.
+    // m_pHandle is intentionally leaked, see ViewHandle.
 
     delete priv.m_pImpl;
     priv.m_pImpl = nullptr;
@@ -2099,7 +2301,17 @@ lok_doc_view_open_document (LOKDocView* pDocView,
 
     applyOptionalFeatures(priv);
     // Office-level callbacks: password requests and load progress.
-    priv->m_pOffice->pClass->registerCallback(priv->m_pOffice, lokCallback, priv->m_pCallbackData);
+    priv->m_pOffice->pClass->registerCallback(priv->m_pOffice, lokCallback, priv->m_pHandle);
+
+    // documentLoad() can't be interrupted, and the load task keeps this view
+    // alive until it returns. Keep the application running until then too:
+    // exiting with LibreOffice mid-load (never destroy()ed) crashes in its
+    // static destructors.
+    if (GApplication* pApplication = g_application_get_default())
+    {
+        priv->m_pHeldApplication = G_APPLICATION(g_object_ref(pApplication));
+        g_application_hold(pApplication);
+    }
 
     setIsLoading(pDocView, true);
     GTask* pTask = g_task_new(pDocView, cancellable, openDocumentDone, pOuterTask);
@@ -2159,8 +2371,8 @@ lok_doc_view_set_zoom (LOKDocView* pDocView, float fZoom)
         return;
 
     // TODO: keep the point under the pointer / viewport center fixed while zooming.
+    startNewTileGeneration(pDocView, true); // before m_fZoom changes, see there
     priv->m_fZoom = fZoom;
-    priv->m_aTileBuffer.resetAllTiles();
     gtk_widget_queue_resize(GTK_WIDGET(pDocView));
 
     g_object_notify_by_pspec(G_OBJECT(pDocView), properties[PROP_ZOOM]);
@@ -2279,7 +2491,8 @@ lok_doc_view_reset_view(LOKDocView* pDocView)
 {
     LOKDocViewPrivate& priv = getPrivate(pDocView);
 
-    priv->m_aTileBuffer.resetAllTiles();
+    // Different content (e.g. another part): old tiles are no use as placeholder.
+    startNewTileGeneration(pDocView, false);
     priv->m_fLoadProgress = 0.0;
     priv->m_nMouseButtons = 0;
     priv->m_nClickCount = 0;
