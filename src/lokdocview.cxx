@@ -2559,11 +2559,6 @@ static void openDocumentDone(GObject* pSource, GAsyncResult* pResult, gpointer p
             // Explicitly disposed mid-load: dispose had no document to close yet.
             std::scoped_lock<std::mutex> aGuard(g_aLOKMutex);
             pDocument->pClass->destroy(pDocument);
-            if (priv->m_bDisposed && priv->m_pOffice && priv->m_pOffice->pClass->getDocsCount(priv->m_pOffice) == 0)
-            {
-                priv->m_pOffice->pClass->destroy(priv->m_pOffice);
-                priv->m_pOffice = nullptr;
-            }
         }
         setIsLoading(pDocView, false);
         if (pError)
@@ -2860,15 +2855,9 @@ static void lok_doc_view_dispose (GObject* object)
             priv->m_pDocument->pClass->destroyView(priv->m_pDocument, priv->m_nViewId);
             if (priv->m_pDocument->pClass->getViewsCount(priv->m_pDocument) == 0)
             {
-                // Last view(s) gone
+                // Last view(s) gone. The office stays: it can't be started again.
                 g_debug("dispose: destroying document");
                 priv->m_pDocument->pClass->destroy(priv->m_pDocument);
-                if (priv->m_pOffice && priv->m_pOffice->pClass->getDocsCount(priv->m_pOffice) == 0)
-                {
-                    g_debug("dispose: destroying office");
-                    priv->m_pOffice->pClass->destroy(priv->m_pOffice);
-                    priv->m_pOffice = nullptr;
-                }
             }
             priv->m_pDocument = nullptr;
         }
@@ -2951,8 +2940,24 @@ static gboolean lok_doc_view_initable_init (GInitable *initable, GCancellable* /
     LOKDocView *pDocView = LOK_DOC_VIEW (initable);
     LOKDocViewPrivate& priv = getPrivate(pDocView);
 
+    // One LibreOffice per process: it can't be started again once destroyed
+    // (lo_initialize() waits forever for its main thread), so it is never
+    // destroyed and every view shares it.
+    static LibreOfficeKit* s_pOffice = nullptr;
+
     if (priv->m_pOffice != nullptr)
+    {
+        if (!s_pOffice)
+            s_pOffice = priv->m_pOffice;
         return true;
+    }
+
+    if (s_pOffice)
+    {
+        priv->m_pOffice = s_pOffice;
+        applyOptionalFeatures(priv);
+        return true;
+    }
 
     // No "lopath" given (null in lok_doc_view_new*(), or unset with g_initable_new()).
     if (priv->m_aLOPath.empty())
@@ -2971,6 +2976,7 @@ static gboolean lok_doc_view_initable_init (GInitable *initable, GCancellable* /
                      priv->m_aLOPath.c_str());
         return FALSE;
     }
+    s_pOffice = priv->m_pOffice;
     applyOptionalFeatures(priv);
 
     if (priv->m_bUnipoll)

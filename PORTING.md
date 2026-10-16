@@ -162,8 +162,11 @@ Deliberate deviations from GTK3 widget:
   and its deprecated per-type predecessors) through in view-only mode; upstream dropped all commands.
 
 Lifetime (GTK4 has no `destroy` that tears down every child regardless of refs):
-- LibreOffice must be `destroy()`ed before the process exits, or its static destructors crash/hang
-  at exit. Dispose does that, so the view must actually be disposed when its window closes.
+- One LibreOffice per process, shared by all views and never `destroy()`ed: once destroyed it can't
+  be started again (`lo_initialize()` waits forever for its main thread), so a process that previews
+  documents one after another would hang on the second. Dispose destroys the document once its
+  last view is gone. Apps must `_exit()` (below), since LibreOffice's static destructors crash/hang.
+- Views must still actually be disposed when their window closes, to close the document.
 - Async work (LOK callbacks, tile paints) therefore holds a never-freed `ViewHandle` (weak ref +
   tile generation), never a strong ref on the view.
 - The one exception is the load task (`documentLoad()` can't be interrupted); while it runs the
