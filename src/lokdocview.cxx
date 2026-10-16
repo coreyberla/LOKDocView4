@@ -3976,9 +3976,17 @@ static void setZoom(LOKDocView* pDocView, float fZoom, double fAnchorX, double f
 LOK_DOC_VIEW_DLLPUBLIC void
 lok_doc_view_set_zoom (LOKDocView* pDocView, float fZoom)
 {
-    // Keep the center of the view fixed.
+    // Keep the center of the view fixed, except at the start of the document
+    // (e.g. fit-to-width right after loading): stay there.
+    LOKDocViewPrivate& priv = getPrivate(pDocView);
     GtkWidget* pWidget = GTK_WIDGET(pDocView);
-    setZoom(pDocView, fZoom, gtk_widget_get_width(pWidget) / 2.0, gtk_widget_get_height(pWidget) / 2.0);
+    auto getAnchor = [&priv](GtkAdjustment* pAdjustment, double fAnchor, double fAnchorDoc, int nSize) {
+        double fValue = priv->m_bZoomAnchorPending ? fAnchorDoc - fAnchor : gtk_adjustment_get_value(pAdjustment);
+        return fValue <= 0 ? 0.0 : nSize / 2.0;
+    };
+    setZoom(pDocView, fZoom,
+            getAnchor(priv->m_pHAdjustment, priv->m_fAnchorX, priv->m_fAnchorDocX, gtk_widget_get_width(pWidget)),
+            getAnchor(priv->m_pVAdjustment, priv->m_fAnchorY, priv->m_fAnchorDocY, gtk_widget_get_height(pWidget)));
 }
 
 LOK_DOC_VIEW_DLLPUBLIC gfloat

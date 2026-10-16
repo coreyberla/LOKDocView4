@@ -132,7 +132,8 @@ Done:
     (LOK's primary selection is the same per-view LOK clipboard as Ctrl+C): in edit mode it
     left-clicks to place the cursor, then pastes the primary's text. LOK handles mouse events
     asynchronously, so cursor-move-before-paste is likely, not guaranteed.
-- Zoom keeps a document point fixed (`setZoom()`): the view center for `lok_doc_view_set_zoom()`,
+- Zoom keeps a document point fixed (`setZoom()`): the view center for `lok_doc_view_set_zoom()`
+  (on an axis scrolled to the start, the start: fit-to-width after loading must not scroll down),
   the pointer for Ctrl+scroll, the gesture center for pinch (`GtkGestureZoom`). The scroll
   position is applied in `size_allocate`, once the adjustments know the new size; zoom steps
   before that continue from the pending target. `setClientZoom` is coalesced into a low-priority
