@@ -53,7 +53,7 @@ LOK_DOC_VIEW_DLLPUBLIC GType   lok_doc_view_get_type               (void) G_GNUC
 /**
  * lok_doc_view_new:
  * @pPath: (nullable): LibreOffice install path. Pass null to use the default.
- * @cancellable: The cancellable object that you can use to cancel this
+ * @cancellable: (nullable): The cancellable object that you can use to cancel this
  * operation.
  * @error: The error that will be set if the object fails to initialize.
  *
@@ -69,7 +69,7 @@ LOK_DOC_VIEW_DLLPUBLIC GtkWidget* lok_doc_view_new                 (const gchar*
  * @pUserProfile: (nullable): User profile URL. Must be either a file URL or a
  * special vnd.sun.star.pathname URL. Pass non-null to be able to use this
  * widget and LibreOffice itself in parallel.
- * @cancellable: The cancellable object that you can use to cancel this
+ * @cancellable: (nullable): The cancellable object that you can use to cancel this
  * operation.
  * @error: The error that will be set if the object fails to initialize.
  *
@@ -93,11 +93,11 @@ LOK_DOC_VIEW_DLLPUBLIC GtkWidget* lok_doc_view_new_from_widget     (LOKDocView* 
 /**
  * lok_doc_view_open_document:
  * @pDocView: The #LOKDocView instance
- * @pPath: (transfer full): The path of the document that #LOKDocView widget should try to open
+ * @pPath: (type filename): The path or URL of the document that #LOKDocView widget should try to open
  * @pRenderingArguments: (nullable): lok::Document::initializeForRendering() arguments.
- * @cancellable:
- * @callback:
- * @userdata:
+ * @cancellable: (nullable): A #GCancellable
+ * @callback: (scope async) (nullable) (closure userdata): Callback invoked when the document has been loaded
+ * @userdata: User data passed to @callback
  */
 LOK_DOC_VIEW_DLLPUBLIC void    lok_doc_view_open_document          (LOKDocView* pDocView,
                                                                     const gchar* pPath,
@@ -109,8 +109,8 @@ LOK_DOC_VIEW_DLLPUBLIC void    lok_doc_view_open_document          (LOKDocView* 
 /**
  * lok_doc_view_open_document_finish:
  * @pDocView: The #LOKDocView instance
- * @res:
- * @error:
+ * @res: The #GAsyncResult passed to the callback
+ * @error: Return location for a #GError, or %NULL
  *
  * Returns: %TRUE if the document is loaded successfully, %FALSE otherwise
  */
@@ -119,7 +119,7 @@ LOK_DOC_VIEW_DLLPUBLIC gboolean lok_doc_view_open_document_finish  (LOKDocView* 
                                                                     GError** error);
 
 /**
- * lok_doc_view_get_document:
+ * lok_doc_view_get_document: (skip)
  * @pDocView: The #LOKDocView instance
  *
  * Gets the document the viewer displays.
@@ -178,7 +178,7 @@ LOK_DOC_VIEW_DLLPUBLIC gint    lok_doc_view_get_part               (LOKDocView* 
 /**
  * lok_doc_view_set_part:
  * @pDocView: The #LOKDocView instance
- * @nPart:
+ * @nPart: The part to switch to, from 0 to lok_doc_view_get_parts() - 1
  */
 LOK_DOC_VIEW_DLLPUBLIC void    lok_doc_view_set_part               (LOKDocView* pDocView,
                                                                     int nPart);
@@ -186,10 +186,10 @@ LOK_DOC_VIEW_DLLPUBLIC void    lok_doc_view_set_part               (LOKDocView* 
 /**
  * lok_doc_view_get_part_name:
  * @pDocView: The #LOKDocView instance
- * @nPart:
+ * @nPart: The part whose name to get
  *
- * Returns: Get current part name of loaded document. Returns null if no
- * document is set, or document has been destroyed using lok_doc_view_destroy_document.
+ * Returns: (nullable) (transfer full): The name of part @nPart of the loaded
+ * document, or null if no document is loaded.
  */
 LOK_DOC_VIEW_DLLPUBLIC gchar*  lok_doc_view_get_part_name          (LOKDocView* pDocView,
                                                                     int nPart);
@@ -197,7 +197,7 @@ LOK_DOC_VIEW_DLLPUBLIC gchar*  lok_doc_view_get_part_name          (LOKDocView* 
 /**
  * lok_doc_view_set_partmode:
  * @pDocView: The #LOKDocView instance
- * @nPartMode:
+ * @nPartMode: The part mode, LOK_PARTMODE_SLIDES or LOK_PARTMODE_NOTES
  */
 LOK_DOC_VIEW_DLLPUBLIC void    lok_doc_view_set_partmode           (LOKDocView* pDocView,
                                                                     int nPartMode);
@@ -250,7 +250,8 @@ LOK_DOC_VIEW_DLLPUBLIC void    lok_doc_view_post_command           (LOKDocView* 
  * Get a json mapping of the possible values for the given command.
  * In the form of: {commandName: unoCmd, commandValues: {possible_values}}
  *
- * Returns: A json mapping of the possible values for the given command
+ * Returns: (nullable) (transfer full): A json mapping of the possible values
+ * for the given command, or null if no document is loaded
  */
 LOK_DOC_VIEW_DLLPUBLIC gchar * lok_doc_view_get_command_values     (LOKDocView* pDocView,
                                                                     const gchar* pCommand);
@@ -299,7 +300,7 @@ LOK_DOC_VIEW_DLLPUBLIC void    lok_doc_view_highlight_all          (LOKDocView* 
  * @pUsedMimeType: (out): output parameter to inform about the determined format
  * (suggested or plain text).
  *
- * Returns: Selected text. The caller must free the returned buffer after
+ * Returns: (nullable) (transfer full): Selected text. The caller must free the returned buffer after
  * use. Returns null if no document is set.
  */
 LOK_DOC_VIEW_DLLPUBLIC gchar*   lok_doc_view_copy_selection        (LOKDocView* pDocView,
@@ -310,7 +311,7 @@ LOK_DOC_VIEW_DLLPUBLIC gchar*   lok_doc_view_copy_selection        (LOKDocView* 
  * lok_doc_view_paste:
  * @pDocView: The #LOKDocView instance
  * @pMimeType: format of pData, for example text/plain;charset=utf-8
- * @pData: the data to be pasted
+ * @pData: (array length=nSize) (element-type guint8): the data to be pasted
  * @nSize: length of data to be pasted
  *
  * Pastes the content at the current cursor position

@@ -2954,8 +2954,7 @@ static gboolean lok_doc_view_initable_init (GInitable *initable, GCancellable* /
     if (priv->m_pOffice != nullptr)
         return true;
 
-    // Also when constructed with g_initable_new() and no "lopath", not just
-    // via lok_doc_view_new*().
+    // No "lopath" given (null in lok_doc_view_new*(), or unset with g_initable_new()).
     if (priv->m_aLOPath.empty())
         priv->m_aLOPath = getDefaultLOPath();
 
@@ -3732,7 +3731,7 @@ LOK_DOC_VIEW_DLLPUBLIC GtkWidget*
 lok_doc_view_new (const gchar* pPath, GCancellable *cancellable, GError **error)
 {
     return GTK_WIDGET (g_initable_new (LOK_TYPE_DOC_VIEW, cancellable, error,
-                                       "lopath", pPath == nullptr ? getDefaultLOPath().c_str() : pPath,
+                                       "lopath", pPath,
                                        nullptr));
 }
 
@@ -3740,7 +3739,7 @@ LOK_DOC_VIEW_DLLPUBLIC GtkWidget*
 lok_doc_view_new_from_user_profile (const gchar* pPath, const gchar* pUserProfile, GCancellable *cancellable, GError **error)
 {
     return GTK_WIDGET(g_initable_new(LOK_TYPE_DOC_VIEW, cancellable, error,
-                                     "lopath", pPath == nullptr ? getDefaultLOPath().c_str() : pPath,
+                                     "lopath", pPath,
                                      "userprofileurl", pUserProfile,
                                      nullptr));
 }

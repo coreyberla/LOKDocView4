@@ -56,6 +56,7 @@ lokdocview_gir = gnome.generate_gir(lokdocview_lib,
   symbol_prefix: 'lok_doc',
   includes: ['Gtk-4.0'],
   header: 'LibreOfficeKit/LibreOfficeKitGtk.h',
+  export_packages: 'lokdocview4',
   install: true,
 )
 

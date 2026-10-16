@@ -45,7 +45,13 @@ meson setup build        # packagers: --prefix=/usr, and -Dlo_path=... if LO isn
 ninja -C build
 ./build/lokdocview4-demo some.odt
 ```
-Deps: gtk4 ≥ 4.12, json-glib-1.0, meson, a C++20 compiler; native LibreOffice at runtime.
+Deps: gtk4 ≥ 4.12, json-glib-1.0, gobject-introspection, meson, a C++20 compiler; native LibreOffice at runtime.
+
+### Introspection
+The build generates and installs `LOKDocView-4.0.gir`/`.typelib` from `LibreOfficeKitGtk.h`, keeping
+the old `LOKDocView-0.1` naming (`LOKDocView.View`); the meson variable is `lokdocview_gir`.
+`lok_doc_view_get_document()` is skipped (raw LOK struct). Annotations live in the header's doc
+comments; properties and signals are documented in `src/lokdocview.cxx`, which the scanner doesn't read.
 
 ### Finding LibreOffice
 Build time never probes the host. `lo_path` (default `<prefix>/<libdir>/libreoffice/program`,
