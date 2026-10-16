@@ -47,6 +47,18 @@ lokdocview_dep = declare_dependency(
   dependencies: gtk_dep,
 )
 
+gnome = import('gnome')
+lokdocview_gir = gnome.generate_gir(lokdocview_lib,
+  sources: ['include/LibreOfficeKit/LibreOfficeKitGtk.h'],
+  namespace: 'LOKDocView',
+  nsversion: '4.0',
+  identifier_prefix: 'LOKDoc',
+  symbol_prefix: 'lok_doc',
+  includes: ['Gtk-4.0'],
+  header: 'LibreOfficeKit/LibreOfficeKitGtk.h',
+  install: true,
+)
+
 install_headers(
   'include/LibreOfficeKit/LibreOfficeKitGtk.h',
   'include/LibreOfficeKit/LibreOfficeKit.h',
